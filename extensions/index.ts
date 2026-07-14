@@ -221,6 +221,13 @@ function stripAnsi(text: string): string {
 	return text.replace(ANSI_RE, "");
 }
 
+function isTuiComponent<T>(value: unknown, ctor: abstract new (...args: never[]) => T, name: string): value is T {
+	if (value instanceof ctor) return true;
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as { constructor?: { name?: unknown }; render?: unknown };
+	return candidate.constructor?.name === name && typeof candidate.render === "function";
+}
+
 function stripRenderedHeadingMarkers(line: string): string {
 	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t])*)#{3,6}[ \t]*((?:\x1b\[[0-9;]*m)*)/, "$1$2");
 }
@@ -726,7 +733,7 @@ function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
 }
 
 function isIgnorableToolSeparator(value: unknown): boolean {
-	if (value instanceof Spacer) return true;
+	if (isTuiComponent(value, Spacer, "Spacer")) return true;
 	if (value instanceof AssistantMessageComponent) {
 		const contentChildren = (value as any).contentContainer?.children;
 		return Array.isArray(contentChildren) && contentChildren.length === 0;
@@ -1152,7 +1159,7 @@ function hiddenThinkingSummaryForMessage(message: any): string {
 }
 
 function isHiddenThinkingPlaceholderText(child: unknown): child is InstanceType<typeof Text> {
-	if (!(child instanceof Text)) return false;
+	if (!isTuiComponent(child, Text, "Text")) return false;
 	const plain = stripAnsi(String((child as any).text ?? "")).trim();
 	if (/^✻\s*Thinking/i.test(plain)) return true;
 	if (/^✻\s*Thought for/i.test(plain)) return true;
@@ -1833,7 +1840,7 @@ function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof
 	if (!root || typeof root !== "object") return;
 	const node = root as { children?: unknown[] };
 	for (const child of node.children ?? []) {
-		if (child instanceof Markdown) visit(child);
+		if (isTuiComponent(child, Markdown, "Markdown")) visit(child);
 		else visitMarkdownDescendants(child, visit);
 	}
 }
@@ -1914,7 +1921,7 @@ function patchAssistantMessages(): void {
 		const mdTheme = (this as any).markdownTheme;
 		for (let i = container.children.length - 1; i >= 0; i--) {
 			const child = container.children[i];
-			if (child instanceof Markdown) {
+			if (isTuiComponent(child, Markdown, "Markdown")) {
 				const text = (child as any).text;
 				if (!text) continue;
 				const isThinking = !!(child as any).defaultTextStyle?.italic;
@@ -4422,24 +4429,10 @@ function prefixThinkingLine(text: string, _theme: Theme | undefined): string {
 	return `Thinking: ${normalized}`;
 }
 
-function trackThinkingBlockEvents(event: any, ctx?: any): void {
+function trackThinkingBlockEvents(event: any): void {
 	const evt = event?.assistantMessageEvent;
 	const message = event?.message;
 	if (!evt || typeof evt.type !== "string") return;
-	function refreshThinkingChrome(): void {
-		try {
-			ctx?.ui?.invalidate?.();
-			ctx?.ui?.requestRender?.();
-		} catch { /* noop */ }
-		// Pi may call AssistantMessageComponent.updateContent before extension
-		// handlers run on the same thinking_end event — nudge one more frame.
-		setTimeout(() => {
-			try {
-				ctx?.ui?.invalidate?.();
-				ctx?.ui?.requestRender?.();
-			} catch { /* noop */ }
-		}, 0);
-	}
 
 	if (evt.type === "thinking_start") {
 		thinkingBlockInFlight = true;
@@ -4449,7 +4442,6 @@ function trackThinkingBlockEvents(event: any, ctx?: any): void {
 			(message as any)[THINKING_ACTIVE_KEY] = true;
 			delete (message as any)[THINKING_DURATION_KEY];
 		}
-		refreshThinkingChrome();
 		return;
 	}
 	if (evt.type === "thinking_end") {
@@ -4463,7 +4455,6 @@ function trackThinkingBlockEvents(event: any, ctx?: any): void {
 			lastThinkingBlockDurationMs = undefined;
 			if (message?.role === "assistant") delete (message as any)[THINKING_DURATION_KEY];
 		}
-		refreshThinkingChrome();
 	}
 }
 
@@ -4511,7 +4502,7 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("message_update", async (event, ctx) => {
-		trackThinkingBlockEvents(event, ctx);
+		trackThinkingBlockEvents(event);
 		patchMessage(event, ctx.ui?.theme);
 	});
 	pi.on("message_end", async (event, ctx) => {

@@ -35,6 +35,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
+    "test": "bun scripts/test-render-cache.ts",
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/index.ts extensions/spinner.ts",
     "pack:dry-run": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run",
@@ -57,7 +58,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.1",
-    "@earendil-works/pi-tui": "^0.79.1",
+    "@earendil-works/pi-tui": "^0.79.10",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.7.0",
     "typescript": "^6.0.3"

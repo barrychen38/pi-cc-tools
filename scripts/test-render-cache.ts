@@ -1,26 +1,34 @@
 import { AssistantMessageComponent, CustomMessageComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { Container } from "@earendil-works/pi-tui";
+import { Container, Loader } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
 
 // Load the extension onto a fake pi so the render patches apply.
+const eventHandlers = new Map<string, Array<(event: any, ctx: any) => Promise<void> | void>>();
 const fakePi = {
 	tools: new Map(), commands: new Map(),
 	registerTool(d: any) { this.tools.set(d.name, d); },
 	registerCommand(n: string, c: any) { this.commands.set(n, c); },
 	registerShortcut(_k: string, _s: any) {},
-	on(_n: string, _h: any) {},
+	on(name: string, handler: (event: any, ctx: any) => Promise<void> | void) {
+		const handlers = eventHandlers.get(name) ?? [];
+		handlers.push(handler);
+		eventHandlers.set(name, handlers);
+	},
 	getThinkingLevel() { return "off"; },
 	getAllTools() { return [...this.tools.values()]; },
 };
 const ext = await import("../extensions/index.ts");
+const spinnerExt = await import("../extensions/spinner.ts");
 ext.default(fakePi as any);
+spinnerExt.default(fakePi as any);
 
 const W = 120;
 
 // Snapshot string-array output for comparison (copy so later mutations don't matter).
 const snap = (v: string[]) => v.join("\n");
+const plain = (value: unknown) => String(value ?? "").replace(/\x1b\[[0-9;]*m/g, "");
 const eq = (a: string[], b: string[], label: string) => {
 	if (snap(a) !== snap(b)) throw new Error(`MISMATCH: ${label}`);
 };
@@ -38,6 +46,10 @@ const neq = (a: string[], b: string[], label: string) => {
 		stopReason: "end_turn",
 	};
 	const c = new AssistantMessageComponent(msg as any, false);
+	const dottedParagraph = (c as any).contentContainer?.children?.find(
+		(child: unknown) => (child as { constructor?: { name?: string } })?.constructor?.name === "DottedParagraph",
+	);
+	if (!dottedParagraph) throw new Error("assistant: cross-instance Markdown patch was not applied");
 	const a = c.render(W);
 	const b = c.render(W); // warm → cache hit
 	eq(b, a, "assistant: warm cache hit must equal cold render");
@@ -153,6 +165,94 @@ const neq = (a: string[], b: string[], label: string) => {
 		process.env.HOME = realHome;
 		fs.rmSync(tmpHome, { recursive: true, force: true });
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. Working indicator uses the public API and the completion line has one
+//    owner. Thinking transitions must not schedule a duplicate status update.
+// ---------------------------------------------------------------------------
+{
+	const loader = new Loader(
+		{ requestRender() {} } as any,
+		(value) => value,
+		(value) => value,
+		"working",
+		{ frames: ["X"], intervalMs: 1_000 },
+	);
+	const loaderText = plain(loader.render(40).join("\n"));
+	loader.stop();
+	if (!loaderText.includes("X working")) {
+		throw new Error("spinner: custom Loader indicator was overridden globally");
+	}
+
+	const workingMessages: Array<string | undefined> = [];
+	const workingIndicators: Array<{ frames?: string[]; intervalMs?: number } | undefined> = [];
+	const ui = {
+		theme,
+		setWorkingMessage(message?: string) { workingMessages.push(message); },
+		setWorkingIndicator(indicator?: { frames?: string[]; intervalMs?: number }) { workingIndicators.push(indicator); },
+		requestRender() {},
+		invalidate() {},
+		notify() {},
+		getToolsExpanded() { return false; },
+		setToolsExpanded() {},
+	};
+	const ctx = { hasUI: true, ui } as any;
+	const fire = async (name: string, event: Record<string, unknown> = { type: name }) => {
+		for (const handler of eventHandlers.get(name) ?? []) {
+			await handler(event, ctx);
+		}
+	};
+
+	await fire("session_start", { type: "session_start", reason: "startup" });
+	const indicator = workingIndicators.find((value) => value !== undefined);
+	if (!indicator || indicator.intervalMs !== 250 || !Array.isArray(indicator.frames) || indicator.frames.length === 0) {
+		throw new Error("spinner: public working indicator was not configured");
+	}
+
+	const message = {
+		role: "assistant",
+		content: [{ type: "text", text: "Lifecycle answer" }],
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	await fire("before_agent_start");
+	await fire("agent_start");
+	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	await fire("message_start", { type: "message_start", message });
+
+	const beforeThinking = workingMessages.length;
+	await fire("message_update", {
+		type: "message_update",
+		message,
+		assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
+	});
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	if (workingMessages.length - beforeThinking !== 1) {
+		throw new Error("spinner: thinking transition produced duplicate working-message updates");
+	}
+
+	await fire("message_end", { type: "message_end", message });
+	await fire("turn_end", { type: "turn_end", turnIndex: 0, message, toolResults: [] });
+	if (workingIndicators.filter((value) => value !== undefined).length !== 1) {
+		throw new Error("spinner: working indicator was configured more than once per session");
+	}
+	const completionLines = plain(message.content[0].text)
+		.split("\n")
+		.filter((line) => line.includes("Turn took"));
+	if (completionLines.length !== 1) {
+		throw new Error(`statusline: expected one completion line, got ${completionLines.length}`);
+	}
+	if (workingMessages.some((value) => plain(value).includes("Turn took"))) {
+		throw new Error("statusline: completion line was duplicated in the working status");
+	}
+
+	await fire("agent_end", { type: "agent_end", messages: [message] });
+	await fire("session_shutdown", { type: "session_shutdown", reason: "exit" });
+	if (workingIndicators.at(-1) !== undefined) {
+		throw new Error("spinner: working indicator was not restored on shutdown");
+	}
+	console.log("OK  spinner lifecycle: public indicator + single completion line + no duplicate status update");
 }
 
 console.log("\nAll correctness checks passed.");

@@ -1,15 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Loader } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
-// Patch built-in Loader with Claude/OpenBrawd-style glyphs.
-// Keep animation cadence constant so the spinner doesn't appear to slow down
-// or freeze as the session grows.
+// Claude/OpenBrawd-style working indicator.
 // ---------------------------------------------------------------------------
 
-const RAW_ANSI_RE = /\x1b\[[0-9;]*m/;
 const RESET = "\x1b[0m";
 
 // Defaults match the previous hardcoded values so behavior is identical
@@ -131,73 +127,10 @@ function getDefaultSpinnerCharacters(): string[] {
 const SPINNER_CHARS = getDefaultSpinnerCharacters();
 const OB_FRAMES = [...SPINNER_CHARS, ...[...SPINNER_CHARS].reverse()];
 const LOADER_INTERVAL_MS = 250;
-const LOADER_LAST_TEXT = Symbol.for("pi-claude-style-tools:loader-last-text");
-const LOADER_ACTIVE = Symbol.for("pi-claude-style-tools:loader-active");
-const LOADER_GENERATION = Symbol.for("pi-claude-style-tools:loader-generation");
-const ACTIVE_UI_SYMBOL = Symbol.for("pi-claude-style-tools:active-ui");
-
-function getLoaderIntervalMs(_loader: any): number {
-	return LOADER_INTERVAL_MS;
-}
 
 function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): void {
 	(timer as any)?.unref?.();
 }
-
-function stopLoaderIfUiStopped(loader: any): boolean {
-	if (!loader?.ui || !(loader.ui as any).stopped) return false;
-	loader.stop?.();
-	return true;
-}
-
-(Loader.prototype as any).updateDisplay = function patchedUpdateDisplay() {
-	if (stopLoaderIfUiStopped(this)) return;
-	const frame = OB_FRAMES[this.currentFrame % OB_FRAMES.length];
-	const message = typeof this.message === "string" && RAW_ANSI_RE.test(this.message)
-		? this.message
-		: this.messageColorFn(this.message);
-	const nextText = `${this.spinnerColorFn(frame)} ${message}`;
-	if ((this as any)[LOADER_LAST_TEXT] === nextText) return;
-	(this as any)[LOADER_LAST_TEXT] = nextText;
-	this.setText(nextText);
-	if (this.ui && !(this.ui as any).stopped) {
-		(globalThis as any)[ACTIVE_UI_SYMBOL] = this.ui;
-		this.ui.requestRender();
-	}
-};
-
-Loader.prototype.start = function patchedStart() {
-	this.stop();
-	(this as any)[LOADER_ACTIVE] = true;
-	const generation = ((this as any)[LOADER_GENERATION] ?? 0) + 1;
-	(this as any)[LOADER_GENERATION] = generation;
-	delete (this as any)[LOADER_LAST_TEXT];
-	(this as any).updateDisplay();
-	if (OB_FRAMES.length <= 1 || stopLoaderIfUiStopped(this)) return;
-	const scheduleNext = () => {
-		if ((this as any)[LOADER_ACTIVE] !== true || (this as any)[LOADER_GENERATION] !== generation || stopLoaderIfUiStopped(this)) return;
-		const intervalMs = getLoaderIntervalMs(this);
-		const timer = setTimeout(() => {
-			(this as any).intervalId = null;
-			if ((this as any)[LOADER_ACTIVE] !== true || (this as any)[LOADER_GENERATION] !== generation || stopLoaderIfUiStopped(this)) return;
-			(this as any).currentFrame = ((this as any).currentFrame + 1) % OB_FRAMES.length;
-			(this as any).updateDisplay();
-			scheduleNext();
-		}, intervalMs);
-		unrefTimer(timer);
-		(this as any).intervalId = timer;
-	};
-	scheduleNext();
-};
-
-Loader.prototype.stop = function patchedStop() {
-	(this as any)[LOADER_ACTIVE] = false;
-	(this as any)[LOADER_GENERATION] = ((this as any)[LOADER_GENERATION] ?? 0) + 1;
-	if ((this as any).intervalId) {
-		clearTimeout((this as any).intervalId);
-		(this as any).intervalId = null;
-	}
-};
 
 // ---------------------------------------------------------------------------
 // Spinner verbs — fun/whimsical loading messages (different set from OpenBrawd)
@@ -449,15 +382,10 @@ const MIN_THINKING_SHOW_MS = 100;
 /** Message refresh cadence. Keep constant so status updates don't stall on long sessions. */
 const WORKING_MESSAGE_INTERVAL_MS = 1_000;
 
-/** Completion message linger */
-const TURN_COMPLETION_MS = 2_500;
-
-
 export default function (pi: ExtensionAPI) {
 	let agentStartTime = 0;
 	let turnStartTime = 0;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-	let completionTimer: ReturnType<typeof setTimeout> | null = null;
 	let thoughtStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let currentVerb = "";
 	let responseLength = 0;
@@ -465,10 +393,23 @@ export default function (pi: ExtensionAPI) {
 	let thinkingStatus: "thinking" | number /* duration ms */ | null = null;
 	let thinkingStartTime = 0;
 	let thoughtForSetAt = 0;
-	let activeTurnId = 0;
 	let turnActive = false;
 	let lastWorkingMessage: string | null = null;
 	let activeCtx: { ui: any; hasUI: boolean } | null = null;
+
+	function syncWorkingIndicator(ctx: { ui: any; hasUI: boolean }): void {
+		if (!ctx.hasUI) return;
+		const frames = OB_FRAMES.map((frame) => {
+			try {
+				return ctx.ui?.theme?.fg?.("accent", frame) ?? frame;
+			} catch {
+				return frame;
+			}
+		});
+		try {
+			ctx.ui.setWorkingIndicator({ frames, intervalMs: LOADER_INTERVAL_MS });
+		} catch { /* noop */ }
+	}
 
 	function getEffortSuffix(): string {
 		try {
@@ -520,7 +461,7 @@ export default function (pi: ExtensionAPI) {
 	function syncWorkingMessage(force = false): void {
 		if (!activeCtx?.hasUI) return;
 		// Re-derive colors on every tick so /cc-spinner verb/status changes
-		// take effect within ~250 ms without waiting for the next pi event.
+		// take effect within ~1s without waiting for the next pi event.
 		// applyThemeColors is identity-cached on (theme, verbKey, statusKey) so
 		// this is cheap when nothing changed.
 		applyThemeColors(activeCtx.ui?.theme);
@@ -583,13 +524,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function clearCompletionTimer(): void {
-		if (completionTimer) {
-			clearTimeout(completionTimer);
-			completionTimer = null;
-		}
-	}
-
 	function clearThoughtStatusTimer(): void {
 		if (thoughtStatusTimer) {
 			clearTimeout(thoughtStatusTimer);
@@ -604,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 		if (remaining <= 0) {
 			thinkingStatus = null;
 			if (turnActive) syncWorkingMessage(true);
-			else if (!completionTimer) restoreDefaultWorkingMessage();
+			else restoreDefaultWorkingMessage();
 			return;
 		}
 		thoughtStatusTimer = setTimeout(() => {
@@ -616,14 +550,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			thinkingStatus = null;
 			if (turnActive) syncWorkingMessage(true);
-			else if (!completionTimer) restoreDefaultWorkingMessage();
+			else restoreDefaultWorkingMessage();
 		}, remaining);
 		unrefTimer(thoughtStatusTimer);
 	}
 
 	function clearDisplay(): void {
 		stopRefreshLoop();
-		clearCompletionTimer();
 		clearThoughtStatusTimer();
 		agentStartTime = 0;
 		turnStartTime = 0;
@@ -656,8 +589,13 @@ export default function (pi: ExtensionAPI) {
 		if (!agentStartTime) agentStartTime = Date.now();
 	});
 
+	pi.on("session_start", async (_event, ctx) => {
+		activeCtx = ctx;
+		applyThemeColors(ctx.ui?.theme);
+		syncWorkingIndicator(ctx);
+	});
+
 	pi.on("turn_start", async (_event, ctx) => {
-		activeTurnId++;
 		turnActive = true;
 		activeCtx = ctx;
 		applyThemeColors(ctx.ui?.theme);
@@ -665,7 +603,6 @@ export default function (pi: ExtensionAPI) {
 		if (!agentStartTime) agentStartTime = turnStartTime;
 		currentVerb = pickVerb();
 		resetResponseTracking();
-		clearCompletionTimer();
 		if (typeof thinkingStatus !== "number" || Date.now() - thoughtForSetAt >= THOUGHT_DISPLAY_MS) {
 			thinkingStatus = null;
 			clearThoughtStatusTimer();
@@ -711,9 +648,6 @@ export default function (pi: ExtensionAPI) {
 		if (statusChanged) {
 			syncWorkingMessage(true);
 			rescheduleRefreshLoop();
-			// Same-frame ordering: ensure footer updates even if pi rendered first.
-			const timer = setTimeout(() => syncWorkingMessage(true), 0);
-			unrefTimer(timer);
 			return;
 		}
 
@@ -727,30 +661,11 @@ export default function (pi: ExtensionAPI) {
 		turnActive = false;
 		activeCtx = ctx;
 		applyThemeColors(ctx.ui?.theme);
-		const turnId = activeTurnId;
-		const elapsed = Date.now() - (agentStartTime || turnStartTime);
 		stopRefreshLoop();
-		clearCompletionTimer();
 
 		if (typeof thinkingStatus === "number" && Date.now() - thoughtForSetAt >= THOUGHT_DISPLAY_MS) {
 			thinkingStatus = null;
 			clearThoughtStatusTimer();
-		}
-
-		if (activeCtx?.hasUI) {
-			const message = `${STATUS_DIM}✻ Turn took ${formatDuration(elapsed)}${RESET}`;
-			lastWorkingMessage = message;
-			try {
-				activeCtx.ui.setWorkingMessage(message);
-			} catch { /* noop */ }
-			completionTimer = setTimeout(() => {
-				completionTimer = null;
-				if (activeTurnId !== turnId) return;
-				restoreDefaultWorkingMessage();
-			}, TURN_COMPLETION_MS);
-			unrefTimer(completionTimer);
-		} else if (typeof thinkingStatus !== "number") {
-			restoreDefaultWorkingMessage();
 		}
 
 		responseLength = 0;
@@ -760,16 +675,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async () => {
 		turnActive = false;
 		agentStartTime = 0;
-		// Preserve the just-finished "Turn took …" line. Pi emits agent_end
-		// immediately after the final turn, so clearing here made the completion
-		// status disappear before users could see it.
-		if (completionTimer) return;
 		clearDisplay();
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		turnActive = false;
 		clearDisplay();
+		if (ctx.hasUI) {
+			try { ctx.ui.setWorkingIndicator(); } catch { /* noop */ }
+		}
 		activeCtx = null;
 	});
 }
