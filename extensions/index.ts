@@ -543,7 +543,10 @@ function getToolGroupOverallStatus(tools: any[]): ToolStatus {
 function groupStatusLight(status: ToolStatus): string {
 	const color = status === "success" ? TOOL_STATUS_SUCCESS : status === "error" ? TOOL_STATUS_ERROR : TOOL_STATUS_PENDING;
 	if (status === "pending") {
-		return isBlinkOn() ? `${TOOL_STATUS_SUCCESS}●${TRANSPARENT_RESET}` : `${TOOL_STATUS_PENDING}○${TRANSPARENT_RESET}`;
+		// Pulse color only, on the shared blink phase. Swapping the glyph
+		// (●/○ are ambiguous-width) or using a wall-clock phase out of sync
+		// with blinkDot made running rows visibly jitter.
+		return isBlinkPhaseOn() ? `${TOOL_STATUS_SUCCESS}●${TRANSPARENT_RESET}` : `${TOOL_STATUS_PENDING}●${TRANSPARENT_RESET}`;
 	}
 	return `${color}●${TRANSPARENT_RESET}`;
 }
@@ -2097,8 +2100,14 @@ function shortPath(cwd: string, filePath: string): string {
 // Status dot — flickers green/gray while pending
 // ---------------------------------------------------------------------------
 
-function isBlinkOn(): boolean {
-	return Math.floor(Date.now() / 500) % 2 === 0;
+/**
+ * Shared blink phase for every pending indicator. Only the global blink timer
+ * flips `_globalBlinkPhase`, so all indicators toggle together exactly once
+ * per interval. When no blink timer is active the phase is treated as off so
+ * idle/pending rows render fully static.
+ */
+function isBlinkPhaseOn(): boolean {
+	return _blinkContexts.size > 0 && _globalBlinkPhase;
 }
 
 function toolHeader(tool: string, summary: string, theme: Theme, prefix = ""): string {
@@ -2510,7 +2519,10 @@ function blinkDot(ctx: any, theme: Theme): string {
 	const key = getBlinkKey(ctx);
 	const idle = pendingToolChromeColor(theme);
 	if (key?._blinkActive !== true) return theme.fg(idle, "○");
-	return _globalBlinkPhase ? theme.fg("success", "●") : theme.fg(idle, "○");
+	// Keep the glyph fixed while blinking: ● and ○ are ambiguous-width
+	// characters, so alternating them every phase shifted the rest of the
+	// line back and forth (visible jitter). Pulse the color instead.
+	return _globalBlinkPhase ? theme.fg("success", "●") : theme.fg(idle, "●");
 }
 
 // ---------------------------------------------------------------------------
