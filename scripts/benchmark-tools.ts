@@ -17,7 +17,7 @@ import {
 import { Container } from "@earendil-works/pi-tui";
 import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
-type Mode = "baseline" | "patched" | "full";
+type Mode = "baseline" | "minimal";
 type ToolDefinition = {
 	name: string;
 	renderCall?: (...args: any[]) => any;
@@ -192,10 +192,6 @@ async function loadToolDefinitions(cwd: string, benchMode: Mode): Promise<Map<st
 	}
 
 	const pi = new FakePi();
-	if (benchMode === "full") {
-		const spinner = await import("../extensions/spinner.ts");
-		spinner.default(pi as any);
-	}
 	const extension = await import("../extensions/index.ts");
 	extension.default(pi as any);
 	return pi.tools;
@@ -402,7 +398,7 @@ async function runExecuteBench(toolDefinitions: Map<string, ToolDefinition>, cwd
 
 	const writeAvgMs = await averageMsAsync(8, async () => {
 		const next = makeTsFile(600 + Math.floor(Math.random() * 20));
-		await writeTool.execute?.("exec-write", { path: writeFile, content: next }, undefined, undefined, undefined);
+		await writeTool.execute?.("exec-write", { path: writeFile, content: next }, undefined, undefined, { cwd } as any);
 	});
 
 	const editAvgMs = await averageMsAsync(6, async ( ) => {
@@ -418,7 +414,7 @@ async function runExecuteBench(toolDefinitions: Map<string, ToolDefinition>, cwd
 			},
 			undefined,
 			undefined,
-			undefined,
+			{ cwd } as any,
 		);
 	});
 

@@ -1,258 +1,182 @@
-import { AssistantMessageComponent, CustomMessageComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { Container, Loader } from "@earendil-works/pi-tui";
+import { AssistantMessageComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
 
-// Load the extension onto a fake pi so the render patches apply.
-const eventHandlers = new Map<string, Array<(event: any, ctx: any) => Promise<void> | void>>();
-const fakePi = {
-	tools: new Map(), commands: new Map(),
-	registerTool(d: any) { this.tools.set(d.name, d); },
-	registerCommand(n: string, c: any) { this.commands.set(n, c); },
-	registerShortcut(_k: string, _s: any) {},
-	on(name: string, handler: (event: any, ctx: any) => Promise<void> | void) {
-		const handlers = eventHandlers.get(name) ?? [];
+type ToolDefinition = {
+	name: string;
+	label: string;
+	description: string;
+	parameters: unknown;
+	renderShell?: "default" | "self";
+	[key: string]: unknown;
+};
+
+class FakePi {
+	tools = new Map<string, ToolDefinition>();
+	events = new Map<string, Array<(...args: unknown[]) => unknown>>();
+
+	registerTool(definition: ToolDefinition): void {
+		this.tools.set(definition.name, definition);
+	}
+
+	registerCommand(): void {}
+	registerShortcut(): void {}
+
+	on(name: string, handler: (...args: unknown[]) => unknown): void {
+	const handlers = this.events.get(name) ?? [];
 		handlers.push(handler);
-		eventHandlers.set(name, handlers);
-	},
-	getThinkingLevel() { return "off"; },
-	getAllTools() { return [...this.tools.values()]; },
-};
-const ext = await import("../extensions/index.ts");
-const spinnerExt = await import("../extensions/spinner.ts");
-ext.default(fakePi as any);
-spinnerExt.default(fakePi as any);
+		this.events.set(name, handlers);
+	}
+}
 
-const W = 120;
+const fakePi = new FakePi();
+const extension = await import("../extensions/index.ts");
+extension.default(fakePi as never);
 
-// Snapshot string-array output for comparison (copy so later mutations don't matter).
-const snap = (v: string[]) => v.join("\n");
-const plain = (value: unknown) => String(value ?? "").replace(/\x1b\[[0-9;]*m/g, "");
-const eq = (a: string[], b: string[], label: string) => {
-	if (snap(a) !== snap(b)) throw new Error(`MISMATCH: ${label}`);
-};
-const neq = (a: string[], b: string[], label: string) => {
-	if (snap(a) === snap(b)) throw new Error(`UNEXPECTED EQUAL: ${label}`);
-};
+const width = 120;
+const cwd = process.cwd();
+const fakeUi = { requestRender() {} };
 
-// ---------------------------------------------------------------------------
-// 1. Assistant message: cache hit is byte-identical; updateContent invalidates.
-// ---------------------------------------------------------------------------
-{
-	const msg = {
-		role: "assistant",
-		content: [{ type: "text", text: "Hello world\n\n- one\n- two\n\n```ts\nconst x = 1;\n```" }],
-		stopReason: "end_turn",
-	};
-	const c = new AssistantMessageComponent(msg as any, false);
-	const dottedParagraph = (c as any).contentContainer?.children?.find(
-		(child: unknown) => (child as { constructor?: { name?: string } })?.constructor?.name === "DottedParagraph",
+function plain(lines: string[]): string {
+	return lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function assert(condition: unknown, message: string): asserts condition {
+	if (!condition) throw new Error(message);
+}
+
+function toolComponent(
+	name: string,
+	args: Record<string, unknown>,
+	result: Record<string, unknown>,
+	definition: ToolDefinition | undefined = fakePi.tools.get(name),
+): ToolExecutionComponent {
+	const component = new ToolExecutionComponent(
+		name,
+		`test-${name}`,
+		args,
+		{ showImages: false },
+		definition as never,
+		fakeUi as never,
+		cwd,
 	);
-	if (!dottedParagraph) throw new Error("assistant: cross-instance Markdown patch was not applied");
-	const a = c.render(W);
-	const b = c.render(W); // warm → cache hit
-	eq(b, a, "assistant: warm cache hit must equal cold render");
-
-	// Mutate content via updateContent; cache must invalidate.
-	const msg2 = {
-		role: "assistant",
-		content: [{ type: "text", text: "Completely different content that should produce different lines." }],
-		stopReason: "end_turn",
-	};
-	c.updateContent(msg2 as any);
-	const d = c.render(W);
-	neq(d, a, "assistant: updateContent did NOT invalidate the render cache (stale output)");
-	const e = c.render(W); // warm again after recompute
-	eq(e, d, "assistant: warm cache hit after updateContent must equal the recompute");
-	console.log("OK  assistant message: cache identical + updateContent invalidates");
+	component.markExecutionStarted();
+	component.setArgsComplete();
+	component.updateResult(result as never, false);
+	return component;
 }
 
-// ---------------------------------------------------------------------------
-// 2. User message: immutable content → deterministic across renders.
-// ---------------------------------------------------------------------------
-{
-	const c = new UserMessageComponent("User asks a question with **bold** and `code`.");
-	const a = c.render(W);
-	const b = c.render(W);
-	eq(b, a, "user: warm cache hit must equal cold render");
-	console.log("OK  user message: cache identical across renders");
+// The extension only replaces the seven built-in display adapters.
+for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
+	assert(fakePi.tools.has(name), `missing built-in override: ${name}`);
 }
 
-// ---------------------------------------------------------------------------
-// 3. Custom message: rebuild() invalidates.
-// ---------------------------------------------------------------------------
+// Successful results are hidden in collapsed mode, while the existing compact
+// title/status style remains visible.
 {
-	const message = { customType: "subagent-notification", content: "✓ Done\n⎿ transcript: foo" };
-	const c = new CustomMessageComponent(message as any, undefined as any);
-	const a = c.render(W);
-	const b = c.render(W);
-	eq(b, a, "custom: warm cache hit must equal cold render");
-	// invalidate() → rebuild() → cache cleared
-	c.invalidate();
-	const d = c.render(W);
-	eq(d, a, "custom: after invalidate output should still be equivalent (same content)");
-	const e = c.render(W);
-	eq(e, d, "custom: warm cache hit after invalidate must equal recompute");
-	console.log("OK  custom message: cache identical + rebuild invalidates");
+	const component = toolComponent("read", { path: "src/index.ts" }, {
+		content: [{ type: "text", text: "success payload\nsecond line" }],
+	});
+	const collapsed = plain(component.render(width));
+	assert(collapsed.includes("● Read src/index.ts"), "collapsed read call style changed");
+	assert(!collapsed.includes("success payload"), "successful collapsed output was not hidden");
+
+	component.setExpanded(true);
+	const expanded = plain(component.render(width));
+	assert(expanded.includes("└─ success payload"), "expanded result did not keep branch styling");
+	console.log("OK  built-in renderer: compact success + styled expanded result");
 }
 
-// ---------------------------------------------------------------------------
-// 4. Parent Container.render must NOT mutate the cached child array.
-//    Render child, capture cached ref, wrap in a parent, render parent, then
-//    re-render child and confirm the cached array is unchanged.
-// ---------------------------------------------------------------------------
+// Partial results never render live previews; the call remains a static
+// pending dot, so no interval or invalidation loop is needed.
 {
-	const msg = { role: "assistant", content: [{ type: "text", text: "Line one\nLine two\nLine three" }], stopReason: "end_turn" };
-	const child = new AssistantMessageComponent(msg as any, false);
-	const first = child.render(W); // populates cache, returns cached ref
-	const snapshot = snap(first);
-	const parent = new Container();
-	parent.addChild(child);
-	parent.render(W); // spreads child's cached array — must not mutate it
-	if (snap(first) !== snapshot) throw new Error("parent render mutated the child's cached array");
-	if (snap(child.render(W)) !== snapshot) throw new Error("child cached array changed after parent render");
-	console.log("OK  parent does not mutate cached child array");
-}
-
-// ---------------------------------------------------------------------------
-// 5. Custom (subagent) message framing follows toolBackgroundMode. Switching
-//    mode must invalidate the cached framing. Uses an isolated temp HOME so the
-//    real ~/.pi/settings.json is never touched.
-// ---------------------------------------------------------------------------
-{
-	const realHome = process.env.HOME;
-	const tmpHome = `${realHome}/.pi-cache-test-home-${Date.now()}`;
-	const fs = await import("node:fs");
-	fs.mkdirSync(`${tmpHome}/.pi`, { recursive: true });
-	process.env.HOME = tmpHome;
-	try {
-		const ccTools = (fakePi as any).commands.get("cc-tools");
-		if (!ccTools) throw new Error("cc-tools command not registered");
-		const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded() { return false; }, setToolsExpanded() {} } } as any;
-		const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└─' are not.
-		const hasFullWidthRule = (lines: string[]) =>
-			lines.some((l) => { const p = stripAnsi(l); return /^─+$/.test(p) && p.length > 5; });
-
-		// Start in outlines mode (default). Render subagent msg → has full-width border rules.
-		ccTools.handler("outlines", ctx);
-		const message = { customType: "subagent-notification", content: "✓ Done\n⎿ transcript: foo" };
-		const c = new CustomMessageComponent(message as any, undefined as any);
-		const outlines = c.render(W);
-		const outlinesWarm = c.render(W);
-		eq(outlinesWarm, outlines, "custom: warm cache identical in outlines mode");
-		if (!hasFullWidthRule(outlines)) {
-			throw new Error("outlines mode did not produce full-width border rule lines");
-		}
-
-		// Switch to default mode (no borders). Cache must miss and reframe.
-		ccTools.handler("default", ctx);
-		const def = c.render(W);
-		neq(def, outlines, "custom: switching toolBackgroundMode did NOT reframe (stale cache)");
-		if (hasFullWidthRule(def)) {
-			throw new Error("default mode still shows full-width border rule lines");
-		}
-		const defWarm = c.render(W);
-		eq(defWarm, def, "custom: warm cache identical in default mode");
-
-		// Switch back to outlines — must reframe again.
-		ccTools.handler("outlines", ctx);
-		const outlinesAgain = c.render(W);
-		eq(outlinesAgain, outlines, "custom: switching back to outlines did not restore original framing");
-		console.log("OK  custom message: toolBackgroundMode change invalidates framing");
-	} finally {
-		process.env.HOME = realHome;
-		fs.rmSync(tmpHome, { recursive: true, force: true });
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 6. Working indicator uses the public API and the completion line has one
-//    owner. Thinking transitions must not schedule a duplicate status update.
-// ---------------------------------------------------------------------------
-{
-	const loader = new Loader(
-		{ requestRender() {} } as any,
-		(value) => value,
-		(value) => value,
-		"working",
-		{ frames: ["X"], intervalMs: 1_000 },
+	const definition = fakePi.tools.get("bash");
+	assert(definition, "missing bash definition");
+	const component = new ToolExecutionComponent(
+		"bash",
+		"test-partial-bash",
+		{ command: "printf hello" },
+		{ showImages: false },
+		definition as never,
+		fakeUi as never,
+		cwd,
 	);
-	const loaderText = plain(loader.render(40).join("\n"));
-	loader.stop();
-	if (!loaderText.includes("X working")) {
-		throw new Error("spinner: custom Loader indicator was overridden globally");
-	}
+	component.markExecutionStarted();
+	const pending = plain(component.render(width));
+	assert(pending.includes("○ Bash $ printf hello"), "pending call did not use static status dot");
+	console.log("OK  pending renderer: no live output preview");
+}
 
-	const workingMessages: Array<string | undefined> = [];
-	const workingIndicators: Array<{ frames?: string[]; intervalMs?: number } | undefined> = [];
-	const ui = {
-		theme,
-		setWorkingMessage(message?: string) { workingMessages.push(message); },
-		setWorkingIndicator(indicator?: { frames?: string[]; intervalMs?: number }) { workingIndicators.push(indicator); },
-		requestRender() {},
-		invalidate() {},
-		notify() {},
-		getToolsExpanded() { return false; },
-		setToolsExpanded() {},
+// Errors stay visible but are reduced to the first line when collapsed.
+{
+	const component = toolComponent("bash", { command: "false" }, {
+		isError: true,
+		content: [{ type: "text", text: "command failed\nverbose diagnostic body" }],
+	});
+	const collapsed = plain(component.render(width));
+	assert(collapsed.includes("● Bash $ false"), "error call style changed");
+	assert(collapsed.includes("└─ command failed"), "collapsed error was hidden");
+	assert(!collapsed.includes("verbose diagnostic body"), "collapsed error was not reduced");
+	console.log("OK  error renderer: first-line error remains visible");
+}
+
+// Unknown tools use the one small generic fallback instead of their full
+// result. This covers MCP/custom tools without wrapping their execute method.
+{
+	const custom: ToolDefinition = {
+		name: "mcp__demo__search",
+		label: "search",
+		description: "test",
+		parameters: {},
+		renderShell: "self",
 	};
-	const ctx = { hasUI: true, ui } as any;
-	const fire = async (name: string, event: Record<string, unknown> = { type: name }) => {
-		for (const handler of eventHandlers.get(name) ?? []) {
-			await handler(event, ctx);
-		}
-	};
+	const component = toolComponent("mcp__demo__search", { query: "needle" }, {
+		content: [{ type: "text", text: "custom result" }],
+	}, custom);
+	const collapsed = plain(component.render(width));
+	assert(collapsed.includes("● MCP needle"), "generic custom call renderer was not installed");
+	assert(collapsed.includes("└─ custom result"), "generic custom result did not show first-line summary");
+	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
+}
 
-	await fire("session_start", { type: "session_start", reason: "startup" });
-	const indicator = workingIndicators.find((value) => value !== undefined);
-	if (!indicator || indicator.intervalMs !== 250 || !Array.isArray(indicator.frames) || indicator.frames.length === 0) {
-		throw new Error("spinner: public working indicator was not configured");
-	}
-
+// The minimal extension does not patch assistant/user/custom message
+// prototypes or mutate assistant content with status lines.
+{
 	const message = {
 		role: "assistant",
-		content: [{ type: "text", text: "Lifecycle answer" }],
+		content: [{ type: "text", text: "hello" }],
 		stopReason: "stop",
-		timestamp: Date.now(),
 	};
-	await fire("before_agent_start");
-	await fire("agent_start");
-	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
-	await fire("message_start", { type: "message_start", message });
-
-	const beforeThinking = workingMessages.length;
-	await fire("message_update", {
-		type: "message_update",
-		message,
-		assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
-	});
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	if (workingMessages.length - beforeThinking !== 1) {
-		throw new Error("spinner: thinking transition produced duplicate working-message updates");
-	}
-
-	await fire("message_end", { type: "message_end", message });
-	await fire("turn_end", { type: "turn_end", turnIndex: 0, message, toolResults: [] });
-	if (workingIndicators.filter((value) => value !== undefined).length !== 1) {
-		throw new Error("spinner: working indicator was configured more than once per session");
-	}
-	const completionLines = plain(message.content[0].text)
-		.split("\n")
-		.filter((line) => line.includes("Turn took"));
-	if (completionLines.length !== 1) {
-		throw new Error(`statusline: expected one completion line, got ${completionLines.length}`);
-	}
-	if (workingMessages.some((value) => plain(value).includes("Turn took"))) {
-		throw new Error("statusline: completion line was duplicated in the working status");
-	}
-
-	await fire("agent_end", { type: "agent_end", messages: [message] });
-	await fire("session_shutdown", { type: "session_shutdown", reason: "exit" });
-	if (workingIndicators.at(-1) !== undefined) {
-		throw new Error("spinner: working indicator was not restored on shutdown");
-	}
-	console.log("OK  spinner lifecycle: public indicator + single completion line + no duplicate status update");
+	const component = new AssistantMessageComponent(message as never, false);
+	const children = (component as unknown as { contentContainer?: { children?: unknown[] } }).contentContainer?.children ?? [];
+	assert(!children.some((child) => (child as { constructor?: { name?: string } }).constructor?.name === "DottedParagraph"), "assistant renderer was globally patched");
+	assert(message.content[0].text === "hello", "assistant message was mutated");
+	console.log("OK  native messages: no global renderer patch or mutation");
 }
 
-console.log("\nAll correctness checks passed.");
+// UI cleanup is done through Pi's public API and has no timers.
+{
+	const workingIndicators: Array<{ frames?: string[] } | undefined> = [];
+	const workingMessages: Array<string | undefined> = [];
+	const visibility: boolean[] = [];
+	const thinkingLabels: Array<string | undefined> = [];
+	const ui = {
+		theme,
+		setWorkingIndicator(value?: { frames?: string[] }) { workingIndicators.push(value); },
+		setWorkingMessage(value?: string) { workingMessages.push(value); },
+		setWorkingVisible(value: boolean) { visibility.push(value); },
+		setHiddenThinkingLabel(value?: string) { thinkingLabels.push(value); },
+	};
+	const context = { hasUI: true, cwd, ui };
+	for (const name of ["session_start", "before_agent_start", "agent_start", "turn_start"]) {
+		for (const handler of fakePi.events.get(name) ?? []) await handler({ type: name }, context);
+	}
+	assert(workingIndicators.at(-1)?.frames?.length === 0, "working indicator was not hidden");
+	assert(workingMessages.at(-1) === "", "working message was not cleared");
+	assert(visibility.at(-1) === false, "working row was not hidden");
+	assert(thinkingLabels.length === 0 || thinkingLabels.at(-1) !== "", "thinking label was cleared — should be left for native pi handling");
+	console.log("OK  public UI cleanup: spinner hidden, thinking label left for native handling");
+}
+
+console.log("\nAll minimal-renderer checks passed.");
