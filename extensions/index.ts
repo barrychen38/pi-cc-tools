@@ -15,7 +15,7 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { Text, type Component } from "@earendil-works/pi-tui";
+import { Spacer, Text, type Component } from "@earendil-works/pi-tui";
 
 type TextBlock = { type: string; text?: string };
 type TextResult = { content: readonly TextBlock[]; details?: unknown };
@@ -36,6 +36,8 @@ const TOOL_PADDING_X = 2;
 const THINKING_TEXT_TRUECOLOR = "\x1b[38;2;165;173;203m";
 const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
+const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer");
+const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
 const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
@@ -181,9 +183,9 @@ function configureMinimalUi(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 	applyThinkingTextColor(ctx.ui.theme);
 	applyToolBackground(ctx.ui.theme, ctx.cwd);
-	ctx.ui.setWorkingIndicator({ frames: [] });
-	ctx.ui.setWorkingMessage(EMPTY_TEXT);
-	ctx.ui.setWorkingVisible(false);
+	ctx.ui.setWorkingIndicator();
+	ctx.ui.setWorkingMessage();
+	ctx.ui.setWorkingVisible(true);
 }
 
 function emptyText(): Text {
@@ -192,6 +194,63 @@ function emptyText(): Text {
 
 function toolText(value: string): Text {
 	return new Text(value, TOOL_PADDING_X, 0);
+}
+
+function patchFirstMessageSpacing(): void {
+	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
+	if (prototype[FIRST_MESSAGE_SPACER_PATCH]) return;
+
+	const original = prototype.addMessageToChat;
+	if (typeof original !== "function") return;
+
+	prototype.addMessageToChat = function (
+		this: { chatContainer?: { children?: Component[] } },
+		message: { role?: unknown; content?: unknown },
+		options?: unknown,
+	) {
+		const textContent = typeof message.content === "string"
+			? message.content
+			: Array.isArray(message.content)
+				? message.content
+					.filter((block): block is { type: "text"; text: string } =>
+						block?.type === "text" && typeof block.text === "string")
+					.map((block) => block.text)
+					.join("")
+				: "";
+		const needsLeadingSpacer =
+			message.role === "user" &&
+			textContent.length > 0 &&
+			this.chatContainer?.children?.length === 0;
+		const result = Reflect.apply(original, this, [message, options]);
+		if (needsLeadingSpacer && this.chatContainer?.children) {
+			this.chatContainer.children.unshift(new Spacer(1));
+		}
+		return result;
+	};
+	prototype[FIRST_MESSAGE_SPACER_PATCH] = true;
+}
+
+function patchEmptyWidgetSpacing(): void {
+	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
+	if (prototype[EMPTY_WIDGET_SPACER_PATCH]) return;
+
+	const original = prototype.renderWidgetContainer;
+	if (typeof original !== "function") return;
+
+	prototype.renderWidgetContainer = function (
+		container: unknown,
+		widgets: Map<string, Component>,
+		spacerWhenEmpty: boolean,
+		leadingSpacer: boolean,
+	) {
+		return Reflect.apply(original, this, [
+			container,
+			widgets,
+			spacerWhenEmpty && widgets.size > 0,
+			leadingSpacer,
+		]);
+	};
+	prototype[EMPTY_WIDGET_SPACER_PATCH] = true;
 }
 
 class ToolIndent implements Component {
@@ -763,6 +822,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI): void {
+	patchFirstMessageSpacing();
+	patchEmptyWidgetSpacing();
 	patchTodoWidgetIndent();
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
@@ -780,6 +841,10 @@ export default function (pi: ExtensionAPI): void {
 	});
 	pi.on("turn_start", async (_event, ctx) => {
 		configureMinimalUi(ctx);
+	});
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setWorkingVisible(false);
 	});
 
 	pi.on("message_update", async (event, _ctx) => {

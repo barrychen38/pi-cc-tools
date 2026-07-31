@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import { Text, type Component } from "@earendil-works/pi-tui";
+import { Container, Text, type Component } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
@@ -167,7 +167,58 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  native messages: ordinary assistant rendering remains unchanged");
 }
 
-// UI cleanup is done through Pi's public API and has no timers.
+// A quiet new session keeps one row above its first user message.
+{
+	const chatContainer = new Container();
+	const fakeInteractiveMode = {
+		chatContainer,
+		getUserMessageText(message: { content?: unknown }) {
+			return typeof message.content === "string" ? message.content : "";
+		},
+		getMarkdownThemeWithSettings() {
+			return undefined;
+		},
+		toolOutputExpanded: false,
+		editor: {},
+	};
+	const addMessageToChat = (InteractiveMode.prototype as unknown as {
+		addMessageToChat(message: unknown, options?: unknown): void;
+	}).addMessageToChat;
+	addMessageToChat.call(fakeInteractiveMode, { role: "user", content: "first message" });
+	assert(chatContainer.children.length === 2, "first user message did not receive one leading spacer");
+	assert(chatContainer.children[0]?.constructor.name === "Spacer", "first user message spacer was not first");
+
+	addMessageToChat.call(fakeInteractiveMode, { role: "user", content: "second message" });
+	assert(chatContainer.children.length === 4, "subsequent user message spacing changed");
+	console.log("OK  first message: one top spacer without changing later spacing");
+}
+
+// Pi's default empty widget spacer must not look like a stopped working row.
+{
+	const renderWidgetContainer = (InteractiveMode.prototype as unknown as {
+		renderWidgetContainer(
+			container: Container,
+			widgets: Map<string, Component>,
+			spacerWhenEmpty: boolean,
+			leadingSpacer: boolean,
+		): void;
+	}).renderWidgetContainer;
+	const container = new Container();
+	renderWidgetContainer.call({}, container, new Map(), true, true);
+	assert(container.children.length === 0, "empty widget container retained a spacer");
+
+	renderWidgetContainer.call(
+		{},
+		container,
+		new Map([["todos", new Text("Todos", 0, 0) as Component]]),
+		true,
+		true,
+	);
+	assert(container.children.length === 2, "non-empty widget spacing changed");
+	console.log("OK  idle layout: empty working/widget area leaves no placeholder");
+}
+
+// Pi's native working indicator remains visible while the agent is streaming.
 {
 	const workingIndicators: Array<{ frames?: string[] } | undefined> = [];
 	const workingMessages: Array<string | undefined> = [];
@@ -184,11 +235,19 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	for (const name of ["session_start", "before_agent_start", "agent_start", "turn_start"]) {
 		for (const handler of fakePi.events.get(name) ?? []) await handler({ type: name }, context);
 	}
-	assert(workingIndicators.at(-1)?.frames?.length === 0, "working indicator was not hidden");
-	assert(workingMessages.at(-1) === "", "working message was not cleared");
-	assert(visibility.at(-1) === false, "empty working row was not hidden");
+	assert(workingIndicators.length > 0 && workingIndicators.at(-1) === undefined, "default working indicator was not restored");
+	assert(workingMessages.length > 0 && workingMessages.at(-1) === undefined, "default working message was not restored");
+	assert(visibility.at(-1) === true, "working indicator row was not enabled");
 	assert(thinkingLabels.length === 0 || thinkingLabels.at(-1) !== "", "thinking label was cleared — should be left for native pi handling");
-	console.log("OK  public UI cleanup: empty working row and spinner hidden");
+	for (const handler of fakePi.events.get("agent_end") ?? []) {
+		await handler({ type: "agent_end" }, context);
+	}
+	assert(visibility.at(-1) === false, "working indicator row remained after agent_end");
+	for (const handler of fakePi.events.get("before_agent_start") ?? []) {
+		await handler({ type: "before_agent_start" }, context);
+	}
+	assert(visibility.at(-1) === true, "working indicator row was not restored for the next run");
+	console.log("OK  working indicator: visible while active, removed after completion");
 }
 
 // ── Alignment: every tool type uses the same left padding ──
