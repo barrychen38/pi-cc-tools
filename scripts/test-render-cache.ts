@@ -1,4 +1,9 @@
-import { AssistantMessageComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { Text, type Component } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
@@ -9,6 +14,7 @@ type ToolDefinition = {
 	description: string;
 	parameters: unknown;
 	renderShell?: "default" | "self";
+	execute?: (...args: unknown[]) => Promise<Record<string, unknown>>;
 	[key: string]: unknown;
 };
 
@@ -39,7 +45,15 @@ const cwd = process.cwd();
 const fakeUi = { requestRender() {} };
 
 function plain(lines: string[]): string {
-	return lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	return stripAnsi(lines.join("\n"));
+}
+
+function stripAnsi(s: string): string {
+	return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function ensureArray(output: string[] | string): string[] {
+	return Array.isArray(output) ? output : [output];
 }
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -129,7 +143,6 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		label: "search",
 		description: "test",
 		parameters: {},
-		renderShell: "self",
 	};
 	const component = toolComponent("mcp__demo__search", { query: "needle" }, {
 		content: [{ type: "text", text: "custom result" }],
@@ -140,8 +153,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
 }
 
-// The minimal extension does not patch assistant/user/custom message
-// prototypes or mutate assistant content with status lines.
+// Ordinary assistant content remains on Pi's native renderer.
 {
 	const message = {
 		role: "assistant",
@@ -152,7 +164,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const children = (component as unknown as { contentContainer?: { children?: unknown[] } }).contentContainer?.children ?? [];
 	assert(!children.some((child) => (child as { constructor?: { name?: string } }).constructor?.name === "DottedParagraph"), "assistant renderer was globally patched");
 	assert(message.content[0].text === "hello", "assistant message was mutated");
-	console.log("OK  native messages: no global renderer patch or mutation");
+	console.log("OK  native messages: ordinary assistant rendering remains unchanged");
 }
 
 // UI cleanup is done through Pi's public API and has no timers.
@@ -174,9 +186,292 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	}
 	assert(workingIndicators.at(-1)?.frames?.length === 0, "working indicator was not hidden");
 	assert(workingMessages.at(-1) === "", "working message was not cleared");
-	assert(visibility.at(-1) === false, "working row was not hidden");
+	assert(visibility.at(-1) === false, "empty working row was not hidden");
 	assert(thinkingLabels.length === 0 || thinkingLabels.at(-1) !== "", "thinking label was cleared — should be left for native pi handling");
-	console.log("OK  public UI cleanup: spinner hidden, thinking label left for native handling");
+	console.log("OK  public UI cleanup: empty working row and spinner hidden");
+}
+
+// ── Alignment: every tool type uses the same left padding ──
+{
+	const testCases: { name: string; args: Record<string, unknown> }[] = [
+		{ name: "read", args: { path: "src/index.ts" } },
+		{ name: "bash", args: { command: "ls -la" } },
+		{ name: "write", args: { path: "src/out.ts", content: "x" } },
+		{ name: "edit", args: { path: "src/out.ts", edits: [{ oldText: "a", newText: "b" }] } },
+		{ name: "grep", args: { pattern: "foo", path: "." } },
+		{ name: "find", args: { pattern: "*.ts", path: "." } },
+		{ name: "ls", args: { path: "." } },
+	];
+
+	function callIndent(line: string): number {
+		const stripped = stripAnsi(line);
+		const match = stripped.match(/^(\s*)/);
+		return match ? match[1].length : 0;
+	}
+
+	function branchIndent(line: string): number | undefined {
+		const stripped = stripAnsi(line);
+		const idx = stripped.indexOf("└─");
+		return idx >= 0 ? idx : undefined;
+	}
+
+	const callIndents = new Map<string, number>();
+
+	for (const { name, args } of testCases) {
+		const component = toolComponent(name, args, {
+			content: [{ type: "text", text: "ok\nline2" }],
+		});
+		const lines = ensureArray(component.render(width)).filter((line) => stripAnsi(line).trim().length > 0);
+
+		// Every tool must show a call line with the status dot
+		const callLine = lines[0];
+		assert(stripAnsi(callLine).includes("●"), `${name} call line was not the first visible line`);
+		const renderedCallIndent = callIndent(callLine);
+		callIndents.set(name, renderedCallIndent);
+
+		// Every tool result (collapsed) must have a branch block
+		const branchLine = lines.find((line) => stripAnsi(line).includes("└─"));
+		const renderedResultIndent = branchLine ? branchIndent(branchLine) : undefined;
+
+		// Error variant: must align with success variant
+		const errComponent = toolComponent(name, args, {
+			isError: true,
+			content: [{ type: "text", text: "fail" }],
+		});
+		const errCallLine = ensureArray(errComponent.render(width)).find((line) => stripAnsi(line).trim().length > 0);
+		assert(errCallLine, `${name} error call line was missing`);
+		const errorCallIndent = callIndent(errCallLine);
+
+		assert(renderedCallIndent === 2, `${name} call indent was ${renderedCallIndent}, expected 2`);
+		assert(renderedResultIndent === 2, `${name} result indent was ${renderedResultIndent}, expected 2`);
+		assert(errorCallIndent === 2, `${name} error call indent was ${errorCallIndent}, expected 2`);
+		console.log(`  ${name.padEnd(6)} call@${renderedCallIndent} branch@${renderedResultIndent ?? "?"} errCall@${errorCallIndent}`);
+	}
+
+	// All call lines must have the same indentation
+	const indentValues = [...new Set(callIndents.values())];
+	assert(indentValues.length === 1, `call line indent varies across tools: ${JSON.stringify([...callIndents])}`);
+
+	console.log(`OK  alignment: all ${testCases.length} tools share call indent=${indentValues[0]}`);
+}
+
+// ── Pending (partial) status dots align with completed dots ──
+{
+	// Pending read
+	const definition = fakePi.tools.get("read");
+	assert(definition, "missing read definition");
+	const pending = new ToolExecutionComponent("read", "test-pending-align", { path: "f" }, { showImages: false }, definition as never, fakeUi as never, cwd);
+	pending.markExecutionStarted();
+	const pendingLine = ensureArray(pending.render(width)).map(stripAnsi).find((line) => line.trim().length > 0) ?? "";
+
+	// Completed read
+	const completed = toolComponent("read", { path: "f" }, { content: [{ type: "text", text: "ok" }] });
+	const completedLine = ensureArray(completed.render(width)).map(stripAnsi).find((line) => line.trim().length > 0) ?? "";
+
+	// Both should have same leading whitespace before content
+	const pendingIndent = pendingLine.match(/^(\s*)/)?.[1].length ?? 0;
+	const completedIndent = completedLine.match(/^(\s*)/)?.[1].length ?? 0;
+	assert(pendingIndent === completedIndent, `pending indent ${pendingIndent} != completed indent ${completedIndent}`);
+	assert(pendingIndent === 2, `pending indent was ${pendingIndent}, expected 2`);
+	console.log("OK  alignment: pending ○ and completed ● share same left indent");
+}
+
+// ── Custom/todo tools use the same unboxed, left-aligned shell ──
+{
+	const todoDefinition: ToolDefinition = {
+		name: "todo",
+		label: "todo",
+		description: "test",
+		parameters: {},
+		renderCall: (_args: unknown, renderTheme: typeof theme) => new Text(
+			renderTheme.fg("toolTitle", "todo create sample"),
+			0,
+			0,
+		),
+		renderResult: (_result: unknown, _options: unknown, renderTheme: typeof theme) => new Text(
+			renderTheme.fg("success", "✓ pending"),
+			0,
+			0,
+		),
+	};
+	const component = toolComponent("todo", { action: "create", subject: "sample" }, {
+		content: [{ type: "text", text: "created" }],
+	}, todoDefinition);
+	const visible = ensureArray(component.render(width)).map(stripAnsi).filter((line) => line.trim().length > 0);
+	assert(visible.some((line) => line.includes("todo create sample")), "todo kept the default colored shell");
+	assert(visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")), `todo output did not use two-column indent: ${JSON.stringify(visible)}`);
+	console.log("OK  alignment: todo/custom shell is unboxed and starts at column 2");
+}
+
+// ── The rpiv-todo widget receives the same two-column indent ──
+{
+	const extensionWidgetsAbove = new Map<string, Component>();
+	const fakeInteractiveMode = {
+		extensionWidgetsAbove,
+		extensionWidgetsBelow: new Map<string, Component>(),
+		ui: {},
+		renderWidgets() {},
+	};
+	const setExtensionWidget = (InteractiveMode.prototype as unknown as {
+		setExtensionWidget(
+			key: string,
+			content: (...args: unknown[]) => Component,
+			options?: unknown,
+		): void;
+	}).setExtensionWidget;
+	setExtensionWidget.call(
+		fakeInteractiveMode,
+		"rpiv-todos",
+		() => new Text("● Todos (0/1)\n└─ ○ Queued", 0, 0),
+		{ placement: "aboveEditor" },
+	);
+	const widget = extensionWidgetsAbove.get("rpiv-todos");
+	assert(widget, "todo widget was not registered");
+	const visible = widget.render(width).map(stripAnsi).filter((line) => line.trim().length > 0);
+	assert(visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")), `todo widget did not use two-column indent: ${JSON.stringify(visible)}`);
+	console.log("OK  alignment: bottom todos widget starts at column 2");
+}
+
+// ── Write/edit summaries count replacements, not just net line changes ──
+{
+	const tempDirectory = mkdtempSync(join(tmpdir(), "pi-cc-tools-test-"));
+	try {
+		const path = "sample.txt";
+		writeFileSync(join(tempDirectory, path), "alpha\nold\nomega\n");
+
+		const writeDefinition = fakePi.tools.get("write");
+		assert(writeDefinition?.execute, "missing write execute override");
+		const writeArgs = { path, content: "alpha\nnew\nomega\n" };
+		const writeResult = await writeDefinition.execute(
+			"test-write-summary",
+			writeArgs,
+			undefined,
+			undefined,
+			{ cwd: tempDirectory },
+		);
+		const writeComponent = toolComponent("write", writeArgs, writeResult, writeDefinition);
+		const writeOutput = plain(ensureArray(writeComponent.render(width)));
+		assert(writeOutput.includes("+1 -1"), `write replacement summary was wrong: ${writeOutput}`);
+
+		const editDefinition = fakePi.tools.get("edit");
+		assert(editDefinition?.execute, "missing edit execute override");
+		const editArgs = { path, edits: [{ oldText: "new", newText: "newer" }] };
+		const editResult = await editDefinition.execute(
+			"test-edit-summary",
+			editArgs,
+			undefined,
+			undefined,
+			{ cwd: tempDirectory },
+		);
+		const editComponent = toolComponent("edit", editArgs, editResult, editDefinition);
+		const editOutput = plain(ensureArray(editComponent.render(width)));
+		assert(editOutput.includes("+1 -1"), `edit replacement summary was wrong: ${editOutput}`);
+		assert(!editOutput.includes("- new") && !editOutput.includes("+ newer"), "edit call leaked diff content");
+		console.log("OK  write/edit summaries: same-size replacements render +1 -1 without diff content");
+	} finally {
+		rmSync(tempDirectory, { recursive: true, force: true });
+	}
+}
+
+// ── Active thinking shows elapsed time without rendering its content ──
+{
+	const historicalMessage = {
+		role: "assistant",
+		content: [{ type: "thinking", thinking: "historical thought" }],
+		stopReason: "stop",
+		timestamp: 1,
+		_piCcToolsThinkDurationMs: 1_234,
+	};
+	const historical = new AssistantMessageComponent(historicalMessage as never, true);
+	assert(plain(ensureArray(historical.render(width))).includes("Thought for 1.2s"), "historical duration label was missing");
+
+	const currentMessageBase = {
+		role: "assistant",
+		stopReason: "stop",
+		timestamp: 2,
+		provider: "test",
+		model: "test",
+	};
+	for (const handler of fakePi.events.get("message_update") ?? []) {
+		await handler({
+			type: "message_update",
+			message: {
+				...currentMessageBase,
+				content: [{ type: "thinking", thinking: "" }],
+			},
+			assistantMessageEvent: { type: "thinking_start" },
+		}, {});
+	}
+
+	const currentDeltaMessage = {
+		...currentMessageBase,
+		content: [{
+			type: "thinking",
+			thinking: Array.from({ length: 12 }, (_, index) => `thought-line-${String(index + 1).padStart(2, "0")}`).join("\n"),
+		}],
+	};
+	for (const handler of fakePi.events.get("message_update") ?? []) {
+		await handler({
+			type: "message_update",
+			message: currentDeltaMessage,
+			assistantMessageEvent: { type: "thinking_delta" },
+		}, {});
+	}
+	const current = new AssistantMessageComponent(currentDeltaMessage as never, true);
+	const activeRender = ensureArray(current.render(width));
+	const thinkingTextAnsi = theme.getColorMode() === "truecolor"
+		? "\x1b[38;2;165;173;203m"
+		: "\x1b[38;5;146m";
+	assert(activeRender.join("\n").includes(thinkingTextAnsi), "active thinking did not use Macchiato Subtext 0");
+	const activeOutput = plain(activeRender);
+	assert(activeOutput.includes("Thinking for "), "active thinking elapsed label was missing");
+	assert(!activeOutput.includes("thought-line-12"), "active thinking content was visible");
+
+	historical.invalidate();
+	const unchangedHistory = plain(ensureArray(historical.render(width)));
+	assert(unchangedHistory.includes("Thought for 1.2s"), "active thinking changed a historical label");
+	assert(!unchangedHistory.includes("thought-line-12"), "current thinking leaked into history");
+
+	await new Promise((resolve) => setTimeout(resolve, 220));
+	current.updateContent(currentDeltaMessage as never);
+	const refreshedOutput = plain(ensureArray(current.render(width)));
+	assert(
+		/Thinking for (?:\d+ms|\d+\.\ds)/.test(refreshedOutput) && refreshedOutput !== activeOutput,
+		"active thinking elapsed label did not refresh",
+	);
+	assert(!refreshedOutput.includes("thought-line-12"), "refreshed thinking content was visible");
+
+	const thinkingEndMessage = {
+		...currentMessageBase,
+		content: currentDeltaMessage.content,
+	};
+	for (const handler of fakePi.events.get("message_update") ?? []) {
+		await handler({
+			type: "message_update",
+			message: thinkingEndMessage,
+			assistantMessageEvent: { type: "thinking_end" },
+		}, {});
+	}
+	current.updateContent(thinkingEndMessage as never);
+	const completedRender = ensureArray(current.render(width));
+	assert(completedRender.join("\n").includes(thinkingTextAnsi), "completed thinking label did not use Macchiato Subtext 0");
+	const completedOutput = plain(completedRender);
+	assert(completedOutput.includes("Thought for "), "completed thinking duration label was missing");
+	assert(!completedOutput.includes("thought-line-12"), "completed thinking content did not collapse");
+
+	const finalMessage = {
+		...currentMessageBase,
+		content: currentDeltaMessage.content,
+	};
+	for (const handler of fakePi.events.get("message_end") ?? []) {
+		await handler({ type: "message_end", message: finalMessage }, {});
+	}
+	assert(typeof (finalMessage as { _piCcToolsThinkDurationMs?: unknown })._piCcToolsThinkDurationMs === "number", "thinking duration was not persisted to the final message");
+	const reloaded = new AssistantMessageComponent(finalMessage as never, true);
+	const reloadedOutput = plain(ensureArray(reloaded.render(width)));
+	assert(reloadedOutput.includes("Thought for "), "persisted thinking duration was not rendered");
+	assert(!reloadedOutput.includes("thought-line-12"), "persisted thinking content was not collapsed");
+	console.log("OK  thinking: elapsed label refreshes, content stays hidden, history stays unchanged");
 }
 
 console.log("\nAll minimal-renderer checks passed.");

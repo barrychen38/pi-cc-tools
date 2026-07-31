@@ -4,6 +4,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
+	AssistantMessageComponent,
+	InteractiveMode,
 	ToolExecutionComponent,
 	createBashTool,
 	createEditTool,
@@ -13,10 +15,10 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component } from "@earendil-works/pi-tui";
 
 type TextBlock = { type: string; text?: string };
-type TextResult = { content: readonly TextBlock[] };
+type TextResult = { content: readonly TextBlock[]; details?: unknown };
 type RenderContext = {
 	cwd: string;
 	isPartial: boolean;
@@ -30,16 +32,58 @@ type SettingsFile = {
 
 const EMPTY_TEXT = "";
 const DEFAULT_EXPANDED_LINES = 2_000;
+const TOOL_PADDING_X = 2;
+const THINKING_TEXT_TRUECOLOR = "\x1b[38;2;165;173;203m";
+const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
+const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
-// ── thinking state ──
-let thinkStartMs = 0;
-let thinkActive = false;
+const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
+type ThinkingState = { active: boolean; startedAt: number; duration?: number };
+const thinkingStates = new Map<string, ThinkingState>();
+
+function thinkingMessageKey(message: Record<string, unknown>): string | undefined {
+	const timestamp = message.timestamp;
+	if (typeof timestamp !== "number") return undefined;
+	const provider = typeof message.provider === "string" ? message.provider : "";
+	const model = typeof message.model === "string" ? message.model : "";
+	return `${provider}:${model}:${timestamp}`;
+}
 
 function formatThinkDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	return `${(ms / 1000).toFixed(1)}s`;
+}
+
+const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
+
+function patchAssistantThinkingLabel(): void {
+	const proto = AssistantMessageComponent.prototype as unknown as Record<PropertyKey, unknown>;
+	if (proto[THINKING_PATCH]) return;
+
+	const original = proto.updateContent as (message: Record<string, unknown>) => void | undefined;
+	if (typeof original !== "function") return;
+
+	proto.updateContent = function patchedUpdateContent(this: {
+		hideThinkingBlock?: boolean;
+		hiddenThinkingLabel?: string;
+	}, message: Record<string, unknown>) {
+		const state = thinkingStates.get(thinkingMessageKey(message) ?? "");
+		const activeDuration = state?.active ? Date.now() - state.startedAt : undefined;
+		const duration = message[THINK_DURATION_KEY] ?? state?.duration;
+		if (activeDuration !== undefined) {
+			this.hiddenThinkingLabel = `Thinking for ${formatThinkDuration(activeDuration)}`;
+		} else if (typeof duration === "number" && duration >= 0) {
+			this.hiddenThinkingLabel = `Thought for ${formatThinkDuration(duration)}`;
+		}
+
+		// Thinking content is intentionally kept collapsed. Streaming message
+		// updates refresh the elapsed label without adding a separate timer.
+		this.hideThinkingBlock = true;
+		return original.call(this, message);
+	};
+	proto[THINKING_PATCH] = true;
 }
 
 // ── caches ──
@@ -107,6 +151,20 @@ function setThemeBackground(theme: Theme, key: string, value: string): void {
 	}
 }
 
+function applyThinkingTextColor(theme: Theme): void {
+	const themeValue = theme as unknown as {
+		fgColors?: Map<string, string> | Record<string, string>;
+	};
+	const value = theme.getColorMode() === "truecolor"
+		? THINKING_TEXT_TRUECOLOR
+		: THINKING_TEXT_256COLOR;
+	if (themeValue.fgColors instanceof Map) {
+		themeValue.fgColors.set("thinkingText", value);
+	} else if (themeValue.fgColors && typeof themeValue.fgColors === "object") {
+		themeValue.fgColors.thinkingText = value;
+	}
+}
+
 function applyToolBackground(theme: Theme, cwd: string): void {
 	const mode = readSettings(cwd).toolBackground;
 	if (!mode || mode === "default") return;
@@ -121,6 +179,7 @@ function applyToolBackground(theme: Theme, cwd: string): void {
 
 function configureMinimalUi(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
+	applyThinkingTextColor(ctx.ui.theme);
 	applyToolBackground(ctx.ui.theme, ctx.cwd);
 	ctx.ui.setWorkingIndicator({ frames: [] });
 	ctx.ui.setWorkingMessage(EMPTY_TEXT);
@@ -128,7 +187,54 @@ function configureMinimalUi(ctx: ExtensionContext): void {
 }
 
 function emptyText(): Text {
-	return new Text(EMPTY_TEXT, 0, 0);
+	return toolText(EMPTY_TEXT);
+}
+
+function toolText(value: string): Text {
+	return new Text(value, TOOL_PADDING_X, 0);
+}
+
+class ToolIndent implements Component {
+	constructor(private readonly child: Component) {}
+
+	render(width: number): string[] {
+		const childWidth = Math.max(1, width - TOOL_PADDING_X);
+		const padding = " ".repeat(TOOL_PADDING_X);
+		return this.child.render(childWidth).map((line) => line ? `${padding}${line}` : line);
+	}
+
+	invalidate(): void {
+		this.child.invalidate();
+	}
+
+	dispose(): void {
+		(this.child as Component & { dispose?: () => void }).dispose?.();
+	}
+}
+
+function patchTodoWidgetIndent(): void {
+	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
+	if (prototype[TODO_WIDGET_PATCH]) return;
+
+	const original = prototype.setExtensionWidget;
+	if (typeof original !== "function") return;
+
+	prototype.setExtensionWidget = function (
+		key: string,
+		content: string[] | ((...args: unknown[]) => Component) | undefined,
+		options?: unknown,
+	) {
+		let indentedContent = content;
+		if (key === "rpiv-todos" && Array.isArray(content)) {
+			// Pi wraps string widgets in Text with one column of host padding.
+			const padding = " ".repeat(Math.max(0, TOOL_PADDING_X - 1));
+			indentedContent = content.map((line) => line ? `${padding}${line}` : line);
+		} else if (key === "rpiv-todos" && typeof content === "function") {
+			indentedContent = (...args: unknown[]) => new ToolIndent(Reflect.apply(content, undefined, args));
+		}
+		return Reflect.apply(original, this, [key, indentedContent, options]);
+	};
+	prototype[TODO_WIDGET_PATCH] = true;
 }
 
 function oneLine(value: unknown, max = 72): string {
@@ -174,7 +280,7 @@ function statusDot(context: RenderContext, theme: Theme): string {
 function renderCallLine(label: string, summary: string, theme: Theme, context: RenderContext): Text {
 	const title = theme.fg("toolTitle", theme.bold(label));
 	const suffix = summary ? ` ${theme.fg("accent", summary)}` : "";
-	return new Text(`${statusDot(context, theme)} ${title}${suffix}`, 0, 0);
+	return toolText(`${statusDot(context, theme)} ${title}${suffix}`);
 }
 
 function textBlocks(result: TextResult): string[] {
@@ -257,24 +363,97 @@ function renderMinimalResult(
 	if (context.isError) {
 		const raw = expanded ? expandedText(result, maxLines) : firstTextLine(result);
 		if (!raw) return emptyText();
-		return new Text(branchBlock(theme.fg("error", raw), theme), 0, 0);
+		return toolText(branchBlock(theme.fg("error", raw), theme));
 	}
 
 	if (!expanded) {
 		const total = textBlocks(result).reduce((sum, b) => sum + b.split("\n").length, 0);
 		if (total === 0) return emptyText();
 		const label = `${total} line${total === 1 ? "" : "s"}`;
-		return new Text(branchBlock(theme.fg("muted", label), theme), 0, 0);
+		return toolText(branchBlock(theme.fg("muted", label), theme));
 	}
 
 	const raw = expandedText(result, maxLines);
 	if (!raw) return emptyText();
-	return new Text(branchBlock(theme.fg("toolOutput", raw), theme), 0, 0);
+	return toolText(branchBlock(theme.fg("toolOutput", raw), theme));
 }
 
 type DiffSummary = { added: number; removed: number; newFile: boolean };
 
 const WRITE_EDIT_DIFF = Symbol.for("pi-cc-tools:write-edit-diff");
+const MAX_LINE_DIFF_CELLS = 1_000_000;
+
+function splitTextLines(text: string): string[] {
+	if (!text) return [];
+	const lines = text.replace(/\r\n?/g, "\n").split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	return lines;
+}
+
+function countCommonLines(before: readonly string[], after: readonly string[]): number {
+	if (before.length === 0 || after.length === 0) return 0;
+	// Bound complete-rewrite work; large unmatched middles are summarized as
+	// removed and added instead of making rendering latency quadratic.
+	if (before.length * after.length > MAX_LINE_DIFF_CELLS) return 0;
+
+	const columns = after.length + 1;
+	let previous = new Uint32Array(columns);
+	let current = new Uint32Array(columns);
+	for (const beforeLine of before) {
+		for (let column = 1; column < columns; column++) {
+			current[column] = beforeLine === after[column - 1]
+				? previous[column - 1] + 1
+				: Math.max(previous[column], current[column - 1]);
+		}
+		[previous, current] = [current, previous];
+		current.fill(0);
+	}
+	return previous[after.length];
+}
+
+function summarizeTextChange(beforeText: string, afterText: string, newFile: boolean): DiffSummary {
+	const before = splitTextLines(beforeText);
+	const after = splitTextLines(afterText);
+
+	let start = 0;
+	while (start < before.length && start < after.length && before[start] === after[start]) start++;
+
+	let beforeEnd = before.length;
+	let afterEnd = after.length;
+	while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+		beforeEnd--;
+		afterEnd--;
+	}
+
+	const changedBefore = before.slice(start, beforeEnd);
+	const changedAfter = after.slice(start, afterEnd);
+	const common = countCommonLines(changedBefore, changedAfter);
+	return {
+		added: changedAfter.length - common,
+		removed: changedBefore.length - common,
+		newFile,
+	};
+}
+
+function summarizeEditResult(result: TextResult): DiffSummary | undefined {
+	if (!result.details || typeof result.details !== "object") return undefined;
+	const diff = (result.details as { diff?: unknown }).diff;
+	if (typeof diff !== "string") return undefined;
+
+	let added = 0;
+	let removed = 0;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("+")) added++;
+		else if (line.startsWith("-")) removed++;
+	}
+	return { added, removed, newFile: false };
+}
+
+function attachDiffSummary(result: TextResult, summary: DiffSummary): void {
+	const details = result.details && typeof result.details === "object" ? result.details : {};
+	(details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] = summary;
+	(result as { details?: unknown }).details = details;
+}
 
 function renderWriteEditResult(
 	result: TextResult,
@@ -284,14 +463,16 @@ function renderWriteEditResult(
 ): Text {
 	if (context.isPartial) return emptyText();
 
-	const summary = (result as unknown as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] as DiffSummary | undefined;
+	const summary = result.details && typeof result.details === "object"
+		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] as DiffSummary | undefined
+		: undefined;
 
 	if (context.isError) {
 		const raw = options.expanded
 			? expandedText(result, DEFAULT_EXPANDED_LINES)
 			: firstTextLine(result);
 		if (!raw) return emptyText();
-		return new Text(branchBlock(theme.fg("error", raw), theme), 0, 0);
+		return toolText(branchBlock(theme.fg("error", raw), theme));
 	}
 
 	if (!options.expanded) {
@@ -302,12 +483,12 @@ function renderWriteEditResult(
 		if (summary.removed > 0) parts.push(theme.fg("error", `-${summary.removed}`));
 		if (summary.added === 0 && summary.removed === 0) parts.push(theme.fg("muted", "unchanged"));
 		if (parts.length === 0) return emptyText();
-		return new Text(branchBlock(parts.join(" "), theme), 0, 0);
+		return toolText(branchBlock(parts.join(" "), theme));
 	}
 
 	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
 	if (!raw) return emptyText();
-	return new Text(branchBlock(theme.fg("toolOutput", raw), theme), 0, 0);
+	return toolText(branchBlock(theme.fg("toolOutput", raw), theme));
 }
 
 function renderBuiltinResult(
@@ -357,7 +538,7 @@ function renderGenericResult(
 			? expandedText(result, DEFAULT_EXPANDED_LINES)
 			: firstTextLine(result);
 		if (!raw) return emptyText();
-		return new Text(branchBlock(theme.fg("error", raw), theme), 0, 0);
+		return toolText(branchBlock(theme.fg("error", raw), theme));
 	}
 
 	if (!options.expanded) {
@@ -365,24 +546,43 @@ function renderGenericResult(
 		// todo, ask_user_question, and other MCP/custom tools.
 		const first = firstTextLine(result);
 		if (!first || first === "Tool failed") return emptyText();
-		return new Text(branchBlock(theme.fg("muted", oneLine(first, 120)), theme), 0, 0);
+		return toolText(branchBlock(theme.fg("muted", oneLine(first, 120)), theme));
 	}
 
 	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
 	if (!raw) return emptyText();
-	return new Text(branchBlock(theme.fg("toolOutput", raw), theme), 0, 0);
+	return toolText(branchBlock(theme.fg("toolOutput", raw), theme));
+}
+
+const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
+
+function keepsOwnRenderer(name: string): boolean {
+	return BUILT_IN_TOOL_NAMES.has(name) || name === "todo";
 }
 
 function patchUnknownToolRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as unknown as Record<PropertyKey, unknown>;
 	if (prototype[GENERIC_RENDERER_PATCH]) return;
 
+	const originalShell = prototype.getRenderShell;
+	if (typeof originalShell === "function") {
+		prototype.getRenderShell = function (this: { toolName?: unknown }) {
+			const name = typeof this.toolName === "string" ? this.toolName : "tool";
+			if (!BUILT_IN_TOOL_NAMES.has(name)) return "self";
+			return Reflect.apply(originalShell, this, []);
+		};
+	}
+
 	const originalCall = prototype.getCallRenderer;
 	if (typeof originalCall === "function") {
 		prototype.getCallRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (name === "read" || name === "bash" || name === "write" || name === "edit" || name === "find" || name === "grep" || name === "ls") {
-				return Reflect.apply(originalCall, this, []);
+			if (keepsOwnRenderer(name)) {
+				const renderer = Reflect.apply(originalCall, this, []) as
+					| ((...args: unknown[]) => Component)
+					| undefined;
+				if (name !== "todo" || !renderer) return renderer;
+				return (...args: unknown[]) => new ToolIndent(renderer(...args));
 			}
 			return (args: unknown, theme: Theme, context: RenderContext) =>
 				renderCallLine(genericLabel(name), genericSummary(args), theme, context);
@@ -393,8 +593,12 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalResult === "function") {
 		prototype.getResultRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (name === "read" || name === "bash" || name === "write" || name === "edit" || name === "find" || name === "grep" || name === "ls") {
-				return Reflect.apply(originalResult, this, []);
+			if (keepsOwnRenderer(name)) {
+				const renderer = Reflect.apply(originalResult, this, []) as
+					| ((...args: unknown[]) => Component)
+					| undefined;
+				if (name !== "todo" || !renderer) return renderer;
+				return (...args: unknown[]) => new ToolIndent(renderer(...args));
 			}
 			return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
 				renderGenericResult(result, options, theme, context);
@@ -515,19 +719,15 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const fp = stringArg(params, "path");
 			const absPath = resolve(ctx.cwd, fp);
-			let oldLines = 0;
+			const existed = existsSync(absPath);
+			let previousContent = "";
 			try {
-				if (existsSync(absPath)) oldLines = readFileSync(absPath, "utf-8").split("\n").length;
-			} catch { /* new file */ }
+				if (existed) previousContent = readFileSync(absPath, "utf-8");
+			} catch { /* Keep the write usable when the old file cannot be read. */ }
 
 			const result = await getBuiltInTools(ctx.cwd).write.execute(toolCallId, params, signal, onUpdate);
 
-			const newLines = String(stringArg(params, "content")).split("\n").length;
-			(result as unknown as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] = {
-				added: Math.max(0, newLines - oldLines),
-				removed: Math.max(0, oldLines - newLines),
-				newFile: oldLines === 0,
-			} satisfies DiffSummary;
+			attachDiffSummary(result, summarizeTextChange(previousContent, stringArg(params, "content"), !existed));
 			return result;
 		},
 		renderCall(args, theme, context) {
@@ -543,25 +743,9 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 		parameters: tools.edit.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const fp = stringArg(params, "path");
-			const absPath = resolve(ctx.cwd, fp);
-			let oldLines = 0;
-			try {
-				if (existsSync(absPath)) oldLines = readFileSync(absPath, "utf-8").split("\n").length;
-			} catch { /* new file */ }
-
 			const result = await getBuiltInTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate);
-
-			let newLines = 0;
-			try {
-				if (existsSync(absPath)) newLines = readFileSync(absPath, "utf-8").split("\n").length;
-			} catch { /* file may not exist after edit */ }
-
-			(result as unknown as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] = {
-				added: Math.max(0, newLines - oldLines),
-				removed: Math.max(0, oldLines - newLines),
-				newFile: oldLines === 0,
-			} satisfies DiffSummary;
+			const summary = summarizeEditResult(result);
+			if (summary) attachDiffSummary(result, summary);
 			return result;
 		},
 		renderCall(args, theme, context) {
@@ -572,62 +756,64 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 			const editCount = Array.isArray(edits) ? edits.length : 0;
 			const countSuffix = editCount > 1 ? ` (${editCount} edits)` : "";
 			const header = `${statusDot(context, theme)} ${theme.fg("toolTitle", theme.bold("Edit"))} ${theme.fg("accent", fp)}${countSuffix}`;
-
-			if (!Array.isArray(edits) || editCount !== 1) {
-				return new Text(header, 0, 0);
-			}
-
-			// Single edit: show a one-line old → new preview
-			const edit = edits[0];
-			const oldSnippet = oneLine(edit.oldText || "", 36) || "...";
-			const newSnippet = oneLine(edit.newText || "", 36) || "...";
-			const preview = [
-				header,
-				`${theme.fg("borderMuted", "│")}  ${theme.fg("error", `- ${oldSnippet}`)}`,
-				`${theme.fg("borderMuted", "│")}  ${theme.fg("success", `+ ${newSnippet}`)}`,
-			].join("\n");
-			return new Text(preview, 0, 0);
+			return toolText(header);
 		},
 		renderResult: renderWriteEditResult,
 	});
 }
 
 export default function (pi: ExtensionAPI): void {
+	patchTodoWidgetIndent();
 	patchUnknownToolRendering();
+	patchAssistantThinkingLabel();
 	registerBuiltInTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
-		thinkActive = false;
+		thinkingStates.clear();
 		configureMinimalUi(ctx);
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
 		configureMinimalUi(ctx);
 	});
 	pi.on("agent_start", async (_event, ctx) => {
-		thinkActive = false;
 		configureMinimalUi(ctx);
 	});
 	pi.on("turn_start", async (_event, ctx) => {
-		thinkActive = false;
 		configureMinimalUi(ctx);
 	});
 
-	pi.on("message_update", async (event, ctx) => {
+	pi.on("message_update", async (event, _ctx) => {
 		const evt = (event as unknown as Record<string, unknown>)?.assistantMessageEvent as
 			| { type?: string }
 			| undefined;
 		if (!evt || typeof evt.type !== "string") return;
 
+		const msg = (event as unknown as Record<string, unknown>).message as Record<PropertyKey, unknown> | undefined;
+		if (!msg) return;
+		const key = thinkingMessageKey(msg as Record<string, unknown>);
+		if (!key) return;
+
 		if (evt.type === "thinking_start") {
-			thinkStartMs = Date.now();
-			thinkActive = true;
-			if (ctx.hasUI) ctx.ui.setHiddenThinkingLabel("Thinking…");
-		} else if (evt.type === "thinking_end" && thinkActive) {
-			const dur = Date.now() - thinkStartMs;
-			thinkActive = false;
-			if (ctx.hasUI && dur >= 200) {
-				ctx.ui.setHiddenThinkingLabel(`Thought for ${formatThinkDuration(dur)}`);
-			}
+			thinkingStates.set(key, { active: true, startedAt: Date.now() });
+		} else if (evt.type === "thinking_end") {
+			const state = thinkingStates.get(key);
+			if (!state?.active) return;
+			state.active = false;
+			state.duration = Date.now() - state.startedAt;
+			msg[THINK_DURATION_KEY] = state.duration;
 		}
+	});
+
+	pi.on("message_end", async (event, _ctx) => {
+		const msg = (event as unknown as Record<string, unknown>).message as Record<PropertyKey, unknown> | undefined;
+		if (!msg) return;
+		const key = thinkingMessageKey(msg as Record<string, unknown>);
+		if (!key) return;
+
+		const state = thinkingStates.get(key);
+		if (state?.duration !== undefined) {
+			msg[THINK_DURATION_KEY] = state.duration;
+		}
+		thinkingStates.delete(key);
 	});
 }

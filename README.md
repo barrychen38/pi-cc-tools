@@ -5,14 +5,16 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 ## Behavior
 
 - Built-in tools keep one compact call row: `read`, `bash`, `grep`, `find`, `ls`, `write`, and `edit`.
-- Successful tool results are hidden by default.
+- Tool calls, results, custom tools, and the `rpiv-todo` panel use a consistent two-column left indent.
+- Collapsed successful results show a line count; `write` and `edit` show only `+N -N`.
 - Failed tool results keep only the first error line visible.
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
-- MCP and unknown custom tools use the same compact fallback renderer.
-- Live output previews, diff generation, syntax highlighting, grouping, turn-time text, thinking summaries, and custom spinners are disabled.
+- MCP and unknown custom tools use the same unboxed compact fallback renderer.
+- Thinking content stays hidden; streaming updates show `Thinking for 1.2s`, then collapse to `Thought for 1.2s` in Catppuccin Macchiato Subtext 0 (`#a5adcb`).
+- Tool-output live previews, diff content, syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
 
-The default render path does not read tool files, calculate diffs, load a syntax highlighter, split successful output, or run a refresh timer.
+The render path does not load a syntax highlighter, render diff content, or run a refresh timer. `write` reads the previous file once to calculate its bounded line-count summary; `edit` reuses Pi's existing result metadata.
 
 ## Configuration
 
@@ -46,4 +48,4 @@ npm run bench:tools -- baseline 120 12 8
 npm run bench:tools -- minimal 120 12 8
 ```
 
-The extension uses Pi's public `registerTool`, `renderCall`, and `renderResult` interfaces. A small private fallback is kept only for tools that do not expose a renderer, so MCP/custom tools also stay compact.
+The extension uses Pi's public `registerTool`, `renderCall`, and `renderResult` interfaces. Small component-level fallbacks keep MCP/custom tool shells compact and replace thinking content with an elapsed-time label.
