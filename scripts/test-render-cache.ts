@@ -18,9 +18,27 @@ type ToolDefinition = {
 	[key: string]: unknown;
 };
 
+class FakeEventBus extends Map<string, Array<(...args: unknown[]) => unknown>> {
+	on(name: string, handler: (data: unknown) => unknown): () => void {
+		const handlers = this.get(name) ?? [];
+		handlers.push(handler);
+		this.set(name, handlers);
+		return () => {
+			const current = this.get(name);
+			if (!current) return;
+			const index = current.indexOf(handler);
+			if (index >= 0) current.splice(index, 1);
+		};
+	}
+
+	emit(name: string, data: unknown): void {
+		for (const handler of this.get(name) ?? []) void handler(data);
+	}
+}
+
 class FakePi {
 	tools = new Map<string, ToolDefinition>();
-	events = new Map<string, Array<(...args: unknown[]) => unknown>>();
+	events = new FakeEventBus();
 
 	registerTool(definition: ToolDefinition): void {
 		this.tools.set(definition.name, definition);
@@ -30,9 +48,7 @@ class FakePi {
 	registerShortcut(): void {}
 
 	on(name: string, handler: (...args: unknown[]) => unknown): void {
-	const handlers = this.events.get(name) ?? [];
-		handlers.push(handler);
-		this.events.set(name, handlers);
+		this.events.on(name, handler);
 	}
 }
 
@@ -151,6 +167,141 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(collapsed.includes("● MCP needle"), "generic custom call renderer was not installed");
 	assert(collapsed.includes("└─ custom result"), "generic custom result did not show first-line summary");
 	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
+}
+
+// Agent rows keep one compact line with the agent type, model, elapsed time,
+// and a live activity/status label. Background lifecycle events update the
+// same row after the Agent tool itself has returned.
+{
+	const agentDefinition: ToolDefinition = {
+		name: "Agent",
+		label: "Agent",
+		description: "test",
+		parameters: {},
+	};
+	const agentArgs = {
+		subagent_type: "Explore",
+		description: "scan API",
+		prompt: "Inspect the API",
+	};
+	const agentContext = {
+		hasUI: true,
+		model: { provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
+	};
+	const startEvent = {
+		type: "tool_execution_start",
+		toolCallId: "test-Agent",
+		toolName: "Agent",
+		args: agentArgs,
+	};
+	for (const handler of fakePi.events.get("tool_execution_start") ?? []) {
+		await handler(startEvent, agentContext);
+	}
+
+	const agent = new ToolExecutionComponent(
+		"Agent",
+		"test-Agent",
+		agentArgs,
+		{ showImages: false },
+		agentDefinition as never,
+		fakeUi as never,
+		cwd,
+	);
+	agent.markExecutionStarted();
+	const partialResult = {
+		content: [{ type: "text", text: "working" }],
+		details: { status: "running", activity: "reading…", toolUses: 1, durationMs: 1_200 },
+	};
+	for (const handler of fakePi.events.get("tool_execution_update") ?? []) {
+		await handler({ ...startEvent, type: "tool_execution_update", partialResult }, agentContext);
+	}
+	agent.updateResult(partialResult as never, true);
+	const running = plain(ensureArray(agent.render(width)));
+	assert(running.includes("○ Agent Explore"), `Agent running row missing: ${running}`);
+	assert(running.includes("sonnet 4"), `Agent parent model missing: ${running}`);
+	assert(running.includes("1.2s"), `Agent elapsed time missing: ${running}`);
+	assert(running.includes("reading…"), `Agent activity missing: ${running}`);
+
+	const completedResult = {
+		content: [{ type: "text", text: "full agent result" }],
+		details: { status: "completed", modelName: "haiku", toolUses: 3, durationMs: 2_345 },
+	};
+	for (const handler of fakePi.events.get("tool_execution_end") ?? []) {
+		await handler({
+			type: "tool_execution_end",
+			toolCallId: "test-Agent",
+			toolName: "Agent",
+			result: completedResult,
+			isError: false,
+		}, agentContext);
+	}
+	agent.updateResult(completedResult as never, false);
+	const completed = plain(ensureArray(agent.render(width)));
+	assert(completed.includes("● Agent Explore"), `Agent completed row missing: ${completed}`);
+	assert(completed.includes("haiku"), `Agent effective model missing: ${completed}`);
+	assert(completed.includes("2.3s"), `Agent final duration missing: ${completed}`);
+	assert(completed.includes("3 tools") && completed.includes("done"), `Agent final stats missing: ${completed}`);
+	assert(!completed.includes("full agent result"), "collapsed Agent result was not kept minimal");
+
+	const backgroundArgs = { ...agentArgs, description: "background scan", run_in_background: true };
+	const backgroundStart = {
+		type: "tool_execution_start",
+		toolCallId: "test-Agent-background",
+		toolName: "Agent",
+		args: backgroundArgs,
+	};
+	for (const handler of fakePi.events.get("tool_execution_start") ?? []) {
+		await handler(backgroundStart, agentContext);
+	}
+	fakePi.events.emit("subagents:created", {
+		id: "agent-background",
+		type: "Explore",
+		description: "background scan",
+		isBackground: true,
+	});
+	const background = new ToolExecutionComponent(
+		"Agent",
+		"test-Agent-background",
+		backgroundArgs,
+		{ showImages: false },
+		agentDefinition as never,
+		fakeUi as never,
+		cwd,
+	);
+	background.markExecutionStarted();
+	const backgroundResult = {
+		content: [{ type: "text", text: "Agent started in background" }],
+		details: { status: "background", agentId: "agent-background", modelName: "haiku", durationMs: 0 },
+	};
+	for (const handler of fakePi.events.get("tool_execution_end") ?? []) {
+		await handler({
+			type: "tool_execution_end",
+			toolCallId: "test-Agent-background",
+			toolName: "Agent",
+			result: backgroundResult,
+			isError: false,
+		}, agentContext);
+	}
+	background.updateResult(backgroundResult as never, false);
+	const backgroundRunning = plain(ensureArray(background.render(width)));
+	assert(backgroundRunning.includes("queued"), `background queued state missing: ${backgroundRunning}`);
+	fakePi.events.emit("subagents:started", {
+		id: "agent-background",
+		type: "Explore",
+		description: "background scan",
+	});
+	assert(plain(ensureArray(background.render(width))).includes("working…"), "background start event did not update Agent state");
+	fakePi.events.emit("subagents:completed", {
+		id: "agent-background",
+		type: "Explore",
+		description: "background scan",
+		status: "completed",
+		toolUses: 4,
+		durationMs: 4_321,
+	});
+	const backgroundCompleted = plain(ensureArray(background.render(width)));
+	assert(backgroundCompleted.includes("4.3s") && backgroundCompleted.includes("4 tools") && backgroundCompleted.includes("done"), `background completion stats missing: ${backgroundCompleted}`);
+	console.log("OK  subagent renderer: live model/time/activity + background lifecycle state");
 }
 
 // Ordinary assistant content remains on Pi's native renderer.

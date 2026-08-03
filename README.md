@@ -11,12 +11,13 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - Failed tool results keep only the first error line visible.
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
 - MCP and unknown custom tools use the same unboxed compact fallback renderer.
+- `Agent` rows show `type · model · elapsed · activity/status` in one compact line; background lifecycle updates keep that line current.
 - Thinking content stays hidden; streaming updates show `Thinking for 1.2s`, then collapse to `Thought for 1.2s` in Catppuccin Macchiato Subtext 0 (`#a5adcb`).
 - Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row and the empty widget spacer when the run ends.
 - Tool-output live previews, diff content, syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
 
-The extension does not load a syntax highlighter, render diff content, or add a refresh timer; the restored native working indicator follows Pi's own lifecycle. `write` reads the previous file once to calculate its bounded line-count summary; `edit` reuses Pi's existing result metadata.
+The extension does not load a syntax highlighter, render diff content, or add a general-purpose refresh timer; it uses one scoped 1-second refresh only while an `Agent` row is active. `write` reads the previous file once to calculate its bounded line-count summary; `edit` reuses Pi's existing result metadata.
 
 ## Configuration
 

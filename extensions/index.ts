@@ -23,6 +23,9 @@ type RenderContext = {
 	cwd: string;
 	isPartial: boolean;
 	isError: boolean;
+	args?: unknown;
+	toolCallId?: string;
+	invalidate?: () => void;
 };
 
 type SettingsFile = {
@@ -41,6 +44,29 @@ const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
 const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
+type SubagentStatus = "queued" | "running" | "background" | "completed" | "failed" | "stopped";
+type SubagentState = {
+	toolCallId: string;
+	type: string;
+	description: string;
+	startedAt: number;
+	completedAt?: number;
+	durationMs?: number;
+	status: SubagentStatus;
+	model?: string;
+	activity?: string;
+	toolUses?: number;
+	agentId?: string;
+	error?: string;
+	backgroundRequested?: boolean;
+	invalidate?: () => void;
+};
+type SubagentEvent = Record<string, unknown>;
+
+const subagentStates = new Map<string, SubagentState>();
+const subagentByAgentId = new Map<string, string>();
+let subagentTimer: ReturnType<typeof setInterval> | undefined;
+
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
 type ThinkingState = { active: boolean; startedAt: number; duration?: number };
 const thinkingStates = new Map<string, ThinkingState>();
@@ -56,6 +82,350 @@ function thinkingMessageKey(message: Record<string, unknown>): string | undefine
 function formatThinkDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function compactModel(value: unknown): string | undefined {
+	let raw: string | undefined;
+	if (typeof value === "string") {
+		raw = value;
+	} else {
+		const record = asRecord(value);
+		const name = record?.name;
+		const id = record?.id;
+		raw = typeof name === "string" && name.trim() ? name : typeof id === "string" ? id : undefined;
+	}
+	if (!raw) return undefined;
+
+	const slash = raw.lastIndexOf("/");
+	const short = (slash >= 0 ? raw.slice(slash + 1) : raw)
+		.replace(/^Claude\s+/i, "")
+		.replace(/\s+\([^)]*\)$/, "")
+		.replace(/[-_]\d{8,}$/, "")
+		.trim()
+		.toLowerCase();
+	return short ? oneLine(short, 32) : undefined;
+}
+
+function subagentType(args: unknown): string {
+	return stringArg(args, "subagent_type") || stringArg(args, "type") || "Agent";
+}
+
+function subagentDescription(args: unknown): string {
+	return oneLine(stringArg(args, "description"), 36);
+}
+
+function isSubagentActive(state: SubagentState): boolean {
+	return state.status === "queued" || state.status === "running" || state.status === "background";
+}
+
+function stopSubagentTimer(): void {
+	if (!subagentTimer) return;
+	clearInterval(subagentTimer);
+	subagentTimer = undefined;
+}
+
+function ensureSubagentTimer(): void {
+	if (subagentTimer) return;
+	// Keep duration live with one low-frequency timer scoped to active agents.
+	subagentTimer = setInterval(() => {
+		let active = false;
+		for (const state of subagentStates.values()) {
+			if (!isSubagentActive(state)) continue;
+			active = true;
+			state.invalidate?.();
+		}
+		if (!active) stopSubagentTimer();
+	}, 1_000);
+	(subagentTimer as unknown as { unref?: () => void }).unref?.();
+}
+
+function refreshSubagentTimer(): void {
+	if ([...subagentStates.values()].some(isSubagentActive)) ensureSubagentTimer();
+	else stopSubagentTimer();
+}
+
+function resetSubagentTracking(): void {
+	subagentStates.clear();
+	subagentByAgentId.clear();
+	stopSubagentTimer();
+}
+
+function createSubagentState(
+	toolCallId: string,
+	args: unknown,
+	status: SubagentStatus,
+	model?: string,
+	store = true,
+): SubagentState {
+	const state: SubagentState = {
+		toolCallId,
+		type: subagentType(args),
+		description: subagentDescription(args),
+		startedAt: Date.now(),
+		status,
+		model: model ?? compactModel(stringArg(args, "model")),
+		backgroundRequested: asRecord(args)?.run_in_background === true,
+	};
+	if (store) subagentStates.set(toolCallId, state);
+	return state;
+}
+
+function linkSubagentAgent(state: SubagentState, agentId: string): void {
+	state.agentId = agentId;
+	subagentByAgentId.set(agentId, state.toolCallId);
+}
+
+function terminalSubagentStatus(status: unknown): SubagentStatus | undefined {
+	if (status === "error" || status === "aborted") return "failed";
+	if (status === "stopped") return "stopped";
+	if (status === "completed" || status === "steered") return "completed";
+	return undefined;
+}
+
+function applySubagentDetails(state: SubagentState, details: unknown): void {
+	const value = asRecord(details);
+	if (!value) return;
+
+	const model = compactModel(value.modelName);
+	if (model) state.model = model;
+	if (typeof value.activity === "string" && value.activity.trim()) {
+		state.activity = oneLine(value.activity, 44);
+	}
+	const toolUses = finiteNumber(value.toolUses);
+	if (toolUses !== undefined) state.toolUses = Math.max(0, Math.floor(toolUses));
+	const durationMs = finiteNumber(value.durationMs);
+	if (durationMs !== undefined && (durationMs > 0 || terminalSubagentStatus(value.status))) {
+		state.durationMs = Math.max(0, durationMs);
+	}
+	if (typeof value.agentId === "string" && value.agentId) linkSubagentAgent(state, value.agentId);
+	if (typeof value.error === "string" && value.error.trim()) state.error = oneLine(value.error, 56);
+
+	if (value.status === "queued") state.status = "queued";
+	else if (value.status === "running") state.status = "running";
+	else if (value.status === "background") {
+		if (state.status !== "running" && state.status !== "queued") state.status = "background";
+	}
+	else {
+		const terminal = terminalSubagentStatus(value.status);
+		if (terminal) {
+			state.status = terminal;
+			state.completedAt ??= Date.now();
+		}
+	}
+}
+
+function subagentEventState(event: SubagentEvent): SubagentState | undefined {
+	const agentId = typeof event.id === "string" ? event.id : undefined;
+	const mappedToolCallId = agentId ? subagentByAgentId.get(agentId) : undefined;
+	if (mappedToolCallId) return subagentStates.get(mappedToolCallId);
+
+	const type = typeof event.type === "string" ? event.type : undefined;
+	const description = typeof event.description === "string" ? event.description : undefined;
+	const active = [...subagentStates.values()].filter((state) => isSubagentActive(state) && !state.agentId);
+	const shortDescription = description ? oneLine(description, 36) : undefined;
+	const exact = active.filter((state) =>
+		(!type || state.type === type) && (!shortDescription || state.description === shortDescription),
+	);
+	const descriptionMatches = shortDescription
+		? active.filter((state) => state.description === shortDescription)
+		: [];
+	const typeMatches = type ? active.filter((state) => state.type === type) : [];
+	const candidate = exact.length === 1
+		? exact[0]
+		: descriptionMatches.length === 1
+			? descriptionMatches[0]
+			: typeMatches.length === 1
+				? typeMatches[0]
+				: active.length === 1
+					? active[0]
+					: undefined;
+	if (!candidate) return undefined;
+	if (agentId) linkSubagentAgent(candidate, agentId);
+	return candidate;
+}
+
+function applySubagentLifecycle(channel: string, event: SubagentEvent): void {
+	const state = subagentEventState(event);
+	if (!state) return;
+
+	if (channel === "subagents:created") {
+		if (state.status !== "running") state.status = "queued";
+	}
+	else if (channel === "subagents:started") {
+		if (state.status === "queued" || state.status === "background") state.startedAt = Date.now();
+		state.status = "running";
+	}
+	else if (channel === "subagents:completed") state.status = "completed";
+	else if (channel === "subagents:failed") state.status = terminalSubagentStatus(event.status) ?? "failed";
+	else return;
+
+	const toolUses = finiteNumber(event.toolUses);
+	if (toolUses !== undefined) state.toolUses = Math.max(0, Math.floor(toolUses));
+	const durationMs = finiteNumber(event.durationMs);
+	if (durationMs !== undefined) state.durationMs = Math.max(0, durationMs);
+	if (typeof event.error === "string" && event.error.trim()) state.error = oneLine(event.error, 56);
+	if (!isSubagentActive(state)) state.completedAt ??= Date.now();
+	state.invalidate?.();
+	refreshSubagentTimer();
+}
+
+function extractResultError(result: unknown): string | undefined {
+	const record = asRecord(result);
+	if (!Array.isArray(record?.content)) return undefined;
+	const blocks = record.content.filter((block): block is TextBlock => {
+		const value = asRecord(block);
+		return typeof value?.type === "string" && typeof value.text === "string";
+	});
+	if (blocks.length === 0) return undefined;
+	return firstTextLine({ content: blocks });
+}
+
+function updateSubagentResult(
+	toolCallId: string,
+	args: unknown,
+	result: unknown,
+	isPartial: boolean,
+	isError: boolean,
+	context: RenderContext,
+): void {
+	const state = subagentStates.get(toolCallId) ?? createSubagentState(
+		toolCallId,
+		args,
+		isPartial ? "running" : isError ? "failed" : "completed",
+		undefined,
+	);
+	state.invalidate = context.invalidate;
+	const record = asRecord(result);
+	applySubagentDetails(state, record?.details);
+
+	if (isError) {
+		state.status = "failed";
+		state.error = extractResultError(result) ?? state.error;
+		state.completedAt ??= Date.now();
+	} else if (isPartial) {
+		if (isSubagentActive(state)) state.status = "running";
+	} else if (
+		asRecord(record?.details)?.status === "background" ||
+		state.status === "background" ||
+		state.backgroundRequested && record?.details === undefined
+	) {
+		if (state.status !== "running" && state.status !== "queued") state.status = "background";
+	} else if (state.status !== "failed" && state.status !== "stopped") {
+		state.status = "completed";
+		state.completedAt ??= Date.now();
+	}
+
+	refreshSubagentTimer();
+}
+
+function formatSubagentDuration(state: SubagentState): string {
+	const elapsed = state.durationMs ?? Math.max(0, (state.completedAt ?? Date.now()) - state.startedAt);
+	return `${(elapsed / 1_000).toFixed(1)}s`;
+}
+
+function subagentStatusLabel(state: SubagentState): string {
+	if (state.status === "queued") return "queued";
+	if (state.status === "running") return state.activity ?? "working…";
+	if (state.status === "background") return state.activity ?? "background";
+	if (state.status === "completed") return "done";
+	if (state.status === "stopped") return "stopped";
+	return state.error ? `failed: ${state.error}` : "failed";
+}
+
+function renderSubagentCall(args: unknown, theme: Theme, context: RenderContext): Text {
+	const toolCallId = context.toolCallId ?? "subagent";
+	const state = subagentStates.get(toolCallId) ?? createSubagentState(
+		toolCallId,
+		args,
+		context.isPartial ? "running" : context.isError ? "failed" : "completed",
+		undefined,
+		false,
+	);
+	state.invalidate = context.invalidate;
+	const titleText = state.type === "Agent" ? "Agent" : `Agent ${state.type}`;
+	const title = theme.fg("toolTitle", theme.bold(titleText));
+	const parts = [state.description, state.model ?? "model?", formatSubagentDuration(state)];
+	if (state.toolUses && state.toolUses > 0) parts.push(`${state.toolUses} tools`);
+	parts.push(subagentStatusLabel(state));
+	const icon = state.status === "failed" ? "✗" : state.status === "completed" ? "●" : "○";
+	const iconColor = state.status === "failed" ? "error" : state.status === "completed" ? "success" : "muted";
+	const summaryColor = state.status === "failed" ? "error" : "accent";
+	return toolText(`${theme.fg(iconColor, icon)} ${title} ${theme.fg(summaryColor, parts.filter(Boolean).join(" · "))}`);
+}
+
+function renderSubagentResult(
+	result: TextResult,
+	options: { expanded: boolean },
+	theme: Theme,
+	context: RenderContext,
+): Text {
+	const toolCallId = context.toolCallId ?? "subagent";
+	updateSubagentResult(toolCallId, context.args, result, context.isPartial, context.isError, context);
+	if (context.isPartial || !options.expanded) return emptyText();
+
+	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
+	if (!raw) return emptyText();
+	return toolText(branchBlock(theme.fg(context.isError ? "error" : "toolOutput", raw), theme));
+}
+
+function registerSubagentTracking(pi: ExtensionAPI): void {
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (ctx.hasUI === false) return;
+		if (event.toolName !== "Agent") return;
+		const backgroundRequested = asRecord(event.args)?.run_in_background === true;
+		const state = subagentStates.get(event.toolCallId) ?? createSubagentState(
+			event.toolCallId,
+			event.args,
+			backgroundRequested ? "queued" : "running",
+			compactModel(stringArg(event.args, "model")) ?? compactModel(ctx.model),
+		);
+		state.type = subagentType(event.args);
+		state.description = subagentDescription(event.args);
+		state.backgroundRequested = backgroundRequested;
+		if (backgroundRequested && state.status === "running") state.status = "queued";
+		state.model ??= compactModel(ctx.model);
+		ensureSubagentTimer();
+	});
+
+	pi.on("tool_execution_update", async (event, _ctx) => {
+		if (_ctx.hasUI === false) return;
+		if (event.toolName !== "Agent") return;
+		const result = event.partialResult as unknown;
+		updateSubagentResult(event.toolCallId, event.args, result, true, false, {
+			cwd: process.cwd(),
+			isPartial: true,
+			isError: false,
+		});
+	});
+
+	pi.on("tool_execution_end", async (event, _ctx) => {
+		if (_ctx.hasUI === false) return;
+		if (event.toolName !== "Agent") return;
+		const state = subagentStates.get(event.toolCallId);
+		if (!state) return;
+		updateSubagentResult(event.toolCallId, {}, event.result, false, event.isError, {
+			cwd: process.cwd(),
+			isPartial: false,
+			isError: event.isError,
+		});
+	});
+
+	const events = (pi as unknown as {
+		events?: { on?: (channel: string, handler: (data: unknown) => void) => unknown };
+	}).events;
+	if (!events?.on) return;
+	// pi-subagents publishes background lifecycle events on Pi's shared bus.
+	for (const channel of ["subagents:created", "subagents:started", "subagents:completed", "subagents:failed"]) {
+		events.on(channel, (data) => applySubagentLifecycle(channel, asRecord(data) ?? {}));
+	}
 }
 
 const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
@@ -636,6 +1006,10 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalCall === "function") {
 		prototype.getCallRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
+			if (name === "Agent") {
+				return (args: unknown, theme: Theme, context: RenderContext) =>
+					renderSubagentCall(args, theme, context);
+			}
 			if (keepsOwnRenderer(name)) {
 				const renderer = Reflect.apply(originalCall, this, []) as
 					| ((...args: unknown[]) => Component)
@@ -652,6 +1026,10 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalResult === "function") {
 		prototype.getResultRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
+			if (name === "Agent") {
+				return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
+					renderSubagentResult(result, options, theme, context);
+			}
 			if (keepsOwnRenderer(name)) {
 				const renderer = Reflect.apply(originalResult, this, []) as
 					| ((...args: unknown[]) => Component)
@@ -828,9 +1206,11 @@ export default function (pi: ExtensionAPI): void {
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
 	registerBuiltInTools(pi);
+	registerSubagentTracking(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
 		thinkingStates.clear();
+		if (ctx.hasUI) resetSubagentTracking();
 		configureMinimalUi(ctx);
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
