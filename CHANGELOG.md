@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `Agent` / subagent tool rendering now passes through the tool's own registered shell, call renderer, and result renderer instead of applying a separate compact live-status renderer.
+- File-changing `write` and `edit` results now share the same output shape: `+N -N` summary plus a bounded diff preview so changed code is visible without expanding the tool.
+- Optional `diffRenderer: "delta" | "auto"` support uses a local `delta` executable for compact `write` / `edit` previews, omitting file and hunk headers while keeping line numbers and falling back to plain diff on failure.
+- Settings cache is refreshed at session/turn start so `/reload` or edited settings are picked up for subsequent tool calls.
+
 ## 1.0.65 — 2026-07-01
 
 ### Fixed

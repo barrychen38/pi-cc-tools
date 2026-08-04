@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -169,139 +169,44 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
 }
 
-// Agent rows keep one compact line with the agent type, model, elapsed time,
-// and a live activity/status label. Background lifecycle events update the
-// same row after the Agent tool itself has returned.
+// Agent/subagent tools keep their own registered renderers instead of the
+// compact MCP/custom fallback, so pi-subagents controls its native output style.
 {
+	let callRendered = false;
+	let resultRendered = false;
 	const agentDefinition: ToolDefinition = {
 		name: "Agent",
 		label: "Agent",
 		description: "test",
 		parameters: {},
+		renderCall() {
+			callRendered = true;
+			return new Text("Native Agent call", 0, 0);
+		},
+		renderResult() {
+			resultRendered = true;
+			return new Text("Native Agent result", 0, 0);
+		},
 	};
-	const agentArgs = {
-		subagent_type: "Explore",
-		description: "scan API",
-		prompt: "Inspect the API",
-	};
-	const agentContext = {
-		hasUI: true,
-		model: { provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
-	};
-	const startEvent = {
-		type: "tool_execution_start",
-		toolCallId: "test-Agent",
-		toolName: "Agent",
-		args: agentArgs,
-	};
-	for (const handler of fakePi.events.get("tool_execution_start") ?? []) {
-		await handler(startEvent, agentContext);
-	}
-
 	const agent = new ToolExecutionComponent(
 		"Agent",
 		"test-Agent",
-		agentArgs,
+		{ subagent_type: "Explore", description: "scan API", prompt: "Inspect the API" },
 		{ showImages: false },
 		agentDefinition as never,
 		fakeUi as never,
 		cwd,
 	);
 	agent.markExecutionStarted();
-	const partialResult = {
-		content: [{ type: "text", text: "working" }],
-		details: { status: "running", activity: "reading…", toolUses: 1, durationMs: 1_200 },
-	};
-	for (const handler of fakePi.events.get("tool_execution_update") ?? []) {
-		await handler({ ...startEvent, type: "tool_execution_update", partialResult }, agentContext);
-	}
-	agent.updateResult(partialResult as never, true);
-	const running = plain(ensureArray(agent.render(width)));
-	assert(running.includes("○ Agent Explore"), `Agent running row missing: ${running}`);
-	assert(running.includes("sonnet 4"), `Agent parent model missing: ${running}`);
-	assert(running.includes("1.2s"), `Agent elapsed time missing: ${running}`);
-	assert(running.includes("reading…"), `Agent activity missing: ${running}`);
+	agent.updateResult({ content: [{ type: "text", text: "full agent result" }] } as never, false);
+	const rendered = plain(ensureArray(agent.render(width)));
 
-	const completedResult = {
-		content: [{ type: "text", text: "full agent result" }],
-		details: { status: "completed", modelName: "haiku", toolUses: 3, durationMs: 2_345 },
-	};
-	for (const handler of fakePi.events.get("tool_execution_end") ?? []) {
-		await handler({
-			type: "tool_execution_end",
-			toolCallId: "test-Agent",
-			toolName: "Agent",
-			result: completedResult,
-			isError: false,
-		}, agentContext);
-	}
-	agent.updateResult(completedResult as never, false);
-	const completed = plain(ensureArray(agent.render(width)));
-	assert(completed.includes("● Agent Explore"), `Agent completed row missing: ${completed}`);
-	assert(completed.includes("haiku"), `Agent effective model missing: ${completed}`);
-	assert(completed.includes("2.3s"), `Agent final duration missing: ${completed}`);
-	assert(completed.includes("3 tools") && completed.includes("done"), `Agent final stats missing: ${completed}`);
-	assert(!completed.includes("full agent result"), "collapsed Agent result was not kept minimal");
-
-	const backgroundArgs = { ...agentArgs, description: "background scan", run_in_background: true };
-	const backgroundStart = {
-		type: "tool_execution_start",
-		toolCallId: "test-Agent-background",
-		toolName: "Agent",
-		args: backgroundArgs,
-	};
-	for (const handler of fakePi.events.get("tool_execution_start") ?? []) {
-		await handler(backgroundStart, agentContext);
-	}
-	fakePi.events.emit("subagents:created", {
-		id: "agent-background",
-		type: "Explore",
-		description: "background scan",
-		isBackground: true,
-	});
-	const background = new ToolExecutionComponent(
-		"Agent",
-		"test-Agent-background",
-		backgroundArgs,
-		{ showImages: false },
-		agentDefinition as never,
-		fakeUi as never,
-		cwd,
-	);
-	background.markExecutionStarted();
-	const backgroundResult = {
-		content: [{ type: "text", text: "Agent started in background" }],
-		details: { status: "background", agentId: "agent-background", modelName: "haiku", durationMs: 0 },
-	};
-	for (const handler of fakePi.events.get("tool_execution_end") ?? []) {
-		await handler({
-			type: "tool_execution_end",
-			toolCallId: "test-Agent-background",
-			toolName: "Agent",
-			result: backgroundResult,
-			isError: false,
-		}, agentContext);
-	}
-	background.updateResult(backgroundResult as never, false);
-	const backgroundRunning = plain(ensureArray(background.render(width)));
-	assert(backgroundRunning.includes("queued"), `background queued state missing: ${backgroundRunning}`);
-	fakePi.events.emit("subagents:started", {
-		id: "agent-background",
-		type: "Explore",
-		description: "background scan",
-	});
-	assert(plain(ensureArray(background.render(width))).includes("working…"), "background start event did not update Agent state");
-	fakePi.events.emit("subagents:completed", {
-		id: "agent-background",
-		type: "Explore",
-		description: "background scan",
-		status: "completed",
-		toolUses: 4,
-		durationMs: 4_321,
-	});
-	const backgroundCompleted = plain(ensureArray(background.render(width)));
-	assert(backgroundCompleted.includes("4.3s") && backgroundCompleted.includes("4 tools") && backgroundCompleted.includes("done"), `background completion stats missing: ${backgroundCompleted}`);
-	console.log("OK  subagent renderer: live model/time/activity + background lifecycle state");
+	assert((agent as unknown as { getRenderShell(): string }).getRenderShell() === "default", "Agent shell was overridden");
+	assert(callRendered && resultRendered, "Agent native renderers were not used");
+	assert(rendered.includes("Native Agent call"), `Agent native call missing: ${rendered}`);
+	assert(rendered.includes("Native Agent result"), `Agent native result missing: ${rendered}`);
+	assert(!rendered.includes("full agent result"), "Agent fell back to generic text output");
+	console.log("OK  Agent renderer: native subagent output stays unchanged");
 }
 
 // Ordinary assistant content remains on Pi's native renderer.
@@ -542,9 +447,11 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  alignment: bottom todos widget starts at column 2");
 }
 
-// ── Write/edit summaries count replacements, not just net line changes ──
+// ── Write/edit summaries count replacements and show changed lines ──
 {
 	const tempDirectory = mkdtempSync(join(tmpdir(), "pi-cc-tools-test-"));
+	const previousRenderer = process.env.PI_CC_TOOLS_DIFF_RENDERER;
+	process.env.PI_CC_TOOLS_DIFF_RENDERER = "plain";
 	try {
 		const path = "sample.txt";
 		writeFileSync(join(tempDirectory, path), "alpha\nold\nomega\n");
@@ -562,6 +469,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		const writeComponent = toolComponent("write", writeArgs, writeResult, writeDefinition);
 		const writeOutput = plain(ensureArray(writeComponent.render(width)));
 		assert(writeOutput.includes("+1 -1"), `write replacement summary was wrong: ${writeOutput}`);
+		assert(writeOutput.includes("-2 old") && writeOutput.includes("+2 new"), `write diff content missing: ${writeOutput}`);
 
 		const editDefinition = fakePi.tools.get("edit");
 		assert(editDefinition?.execute, "missing edit execute override");
@@ -576,9 +484,57 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		const editComponent = toolComponent("edit", editArgs, editResult, editDefinition);
 		const editOutput = plain(ensureArray(editComponent.render(width)));
 		assert(editOutput.includes("+1 -1"), `edit replacement summary was wrong: ${editOutput}`);
-		assert(!editOutput.includes("- new") && !editOutput.includes("+ newer"), "edit call leaked diff content");
-		console.log("OK  write/edit summaries: same-size replacements render +1 -1 without diff content");
+		assert(editOutput.includes("-2 new") && editOutput.includes("+2 newer"), `edit diff content missing: ${editOutput}`);
+		console.log("OK  write/edit summaries: both render replacement diff content");
 	} finally {
+		if (previousRenderer === undefined) delete process.env.PI_CC_TOOLS_DIFF_RENDERER;
+		else process.env.PI_CC_TOOLS_DIFF_RENDERER = previousRenderer;
+		rmSync(tempDirectory, { recursive: true, force: true });
+	}
+}
+
+// ── Optional git-delta rendering is cached on file-change results ──
+{
+	const tempDirectory = mkdtempSync(join(tmpdir(), "pi-cc-tools-delta-test-"));
+	const previousPath = process.env.PATH;
+	const previousRenderer = process.env.PI_CC_TOOLS_DIFF_RENDERER;
+	try {
+		const binDirectory = join(tempDirectory, "bin");
+		const deltaPath = join(binDirectory, "delta");
+		await import("node:fs/promises").then(({ mkdir }) => mkdir(binDirectory));
+		writeFileSync(deltaPath, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat >/dev/null\nprintf '\\nDELTA RENDERED\\n- old from delta\\n+ new from delta\\n'\n");
+		chmodSync(deltaPath, 0o755);
+		process.env.PATH = `${binDirectory}:${previousPath ?? ""}`;
+		process.env.PI_CC_TOOLS_DIFF_RENDERER = "delta";
+
+		const path = "delta-sample.txt";
+		writeFileSync(join(tempDirectory, path), "old\n");
+		const writeDefinition = fakePi.tools.get("write");
+		assert(writeDefinition?.execute, "missing write execute override");
+		const writeArgs = { path, content: "new\n" };
+		const writeResult = await writeDefinition.execute(
+			"test-write-delta",
+			writeArgs,
+			undefined,
+			undefined,
+			{ cwd: tempDirectory },
+		);
+		const writeComponent = toolComponent("write", writeArgs, writeResult, writeDefinition);
+		const writeOutput = plain(ensureArray(writeComponent.render(width)));
+		const deltaArgs = readFileSync(`${deltaPath}.args`, "utf8");
+		assert(writeOutput.includes("DELTA RENDERED"), `delta output missing: ${writeOutput}`);
+		assert(writeOutput.includes("+1 -1"), `delta summary missing: ${writeOutput}`);
+		assert(deltaArgs.includes("--no-gitconfig"), `delta did not ignore verbose user config: ${deltaArgs}`);
+		assert(deltaArgs.includes("--file-style=omit"), `delta did not omit file header: ${deltaArgs}`);
+		assert(deltaArgs.includes("--hunk-header-style=omit"), `delta did not omit hunk header: ${deltaArgs}`);
+		assert(deltaArgs.includes("--line-numbers"), `delta did not keep line numbers: ${deltaArgs}`);
+		assert(!deltaArgs.includes("--color-only"), `delta still uses structure-preserving color-only mode: ${deltaArgs}`);
+		console.log("OK  write/edit renderer: optional compact delta output is used when configured");
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousRenderer === undefined) delete process.env.PI_CC_TOOLS_DIFF_RENDERER;
+		else process.env.PI_CC_TOOLS_DIFF_RENDERER = previousRenderer;
 		rmSync(tempDirectory, { recursive: true, force: true });
 	}
 }

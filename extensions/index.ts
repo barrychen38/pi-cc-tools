@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -28,9 +29,13 @@ type RenderContext = {
 	invalidate?: () => void;
 };
 
+type DiffRenderer = "plain" | "delta" | "auto";
+
 type SettingsFile = {
 	toolBackground?: "default" | "transparent" | "outlines" | "border";
 	expandedPreviewMaxLines?: number;
+	diffRenderer?: DiffRenderer;
+	diffTheme?: string;
 };
 
 const EMPTY_TEXT = "";
@@ -43,29 +48,6 @@ const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer"
 const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
 const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
-
-type SubagentStatus = "queued" | "running" | "background" | "completed" | "failed" | "stopped";
-type SubagentState = {
-	toolCallId: string;
-	type: string;
-	description: string;
-	startedAt: number;
-	completedAt?: number;
-	durationMs?: number;
-	status: SubagentStatus;
-	model?: string;
-	activity?: string;
-	toolUses?: number;
-	agentId?: string;
-	error?: string;
-	backgroundRequested?: boolean;
-	invalidate?: () => void;
-};
-type SubagentEvent = Record<string, unknown>;
-
-const subagentStates = new Map<string, SubagentState>();
-const subagentByAgentId = new Map<string, string>();
-let subagentTimer: ReturnType<typeof setInterval> | undefined;
 
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
 type ThinkingState = { active: boolean; startedAt: number; duration?: number };
@@ -82,350 +64,6 @@ function thinkingMessageKey(message: Record<string, unknown>): string | undefine
 function formatThinkDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	return `${(ms / 1000).toFixed(1)}s`;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-	return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
-}
-
-function finiteNumber(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function compactModel(value: unknown): string | undefined {
-	let raw: string | undefined;
-	if (typeof value === "string") {
-		raw = value;
-	} else {
-		const record = asRecord(value);
-		const name = record?.name;
-		const id = record?.id;
-		raw = typeof name === "string" && name.trim() ? name : typeof id === "string" ? id : undefined;
-	}
-	if (!raw) return undefined;
-
-	const slash = raw.lastIndexOf("/");
-	const short = (slash >= 0 ? raw.slice(slash + 1) : raw)
-		.replace(/^Claude\s+/i, "")
-		.replace(/\s+\([^)]*\)$/, "")
-		.replace(/[-_]\d{8,}$/, "")
-		.trim()
-		.toLowerCase();
-	return short ? oneLine(short, 32) : undefined;
-}
-
-function subagentType(args: unknown): string {
-	return stringArg(args, "subagent_type") || stringArg(args, "type") || "Agent";
-}
-
-function subagentDescription(args: unknown): string {
-	return oneLine(stringArg(args, "description"), 36);
-}
-
-function isSubagentActive(state: SubagentState): boolean {
-	return state.status === "queued" || state.status === "running" || state.status === "background";
-}
-
-function stopSubagentTimer(): void {
-	if (!subagentTimer) return;
-	clearInterval(subagentTimer);
-	subagentTimer = undefined;
-}
-
-function ensureSubagentTimer(): void {
-	if (subagentTimer) return;
-	// Keep duration live with one low-frequency timer scoped to active agents.
-	subagentTimer = setInterval(() => {
-		let active = false;
-		for (const state of subagentStates.values()) {
-			if (!isSubagentActive(state)) continue;
-			active = true;
-			state.invalidate?.();
-		}
-		if (!active) stopSubagentTimer();
-	}, 1_000);
-	(subagentTimer as unknown as { unref?: () => void }).unref?.();
-}
-
-function refreshSubagentTimer(): void {
-	if ([...subagentStates.values()].some(isSubagentActive)) ensureSubagentTimer();
-	else stopSubagentTimer();
-}
-
-function resetSubagentTracking(): void {
-	subagentStates.clear();
-	subagentByAgentId.clear();
-	stopSubagentTimer();
-}
-
-function createSubagentState(
-	toolCallId: string,
-	args: unknown,
-	status: SubagentStatus,
-	model?: string,
-	store = true,
-): SubagentState {
-	const state: SubagentState = {
-		toolCallId,
-		type: subagentType(args),
-		description: subagentDescription(args),
-		startedAt: Date.now(),
-		status,
-		model: model ?? compactModel(stringArg(args, "model")),
-		backgroundRequested: asRecord(args)?.run_in_background === true,
-	};
-	if (store) subagentStates.set(toolCallId, state);
-	return state;
-}
-
-function linkSubagentAgent(state: SubagentState, agentId: string): void {
-	state.agentId = agentId;
-	subagentByAgentId.set(agentId, state.toolCallId);
-}
-
-function terminalSubagentStatus(status: unknown): SubagentStatus | undefined {
-	if (status === "error" || status === "aborted") return "failed";
-	if (status === "stopped") return "stopped";
-	if (status === "completed" || status === "steered") return "completed";
-	return undefined;
-}
-
-function applySubagentDetails(state: SubagentState, details: unknown): void {
-	const value = asRecord(details);
-	if (!value) return;
-
-	const model = compactModel(value.modelName);
-	if (model) state.model = model;
-	if (typeof value.activity === "string" && value.activity.trim()) {
-		state.activity = oneLine(value.activity, 44);
-	}
-	const toolUses = finiteNumber(value.toolUses);
-	if (toolUses !== undefined) state.toolUses = Math.max(0, Math.floor(toolUses));
-	const durationMs = finiteNumber(value.durationMs);
-	if (durationMs !== undefined && (durationMs > 0 || terminalSubagentStatus(value.status))) {
-		state.durationMs = Math.max(0, durationMs);
-	}
-	if (typeof value.agentId === "string" && value.agentId) linkSubagentAgent(state, value.agentId);
-	if (typeof value.error === "string" && value.error.trim()) state.error = oneLine(value.error, 56);
-
-	if (value.status === "queued") state.status = "queued";
-	else if (value.status === "running") state.status = "running";
-	else if (value.status === "background") {
-		if (state.status !== "running" && state.status !== "queued") state.status = "background";
-	}
-	else {
-		const terminal = terminalSubagentStatus(value.status);
-		if (terminal) {
-			state.status = terminal;
-			state.completedAt ??= Date.now();
-		}
-	}
-}
-
-function subagentEventState(event: SubagentEvent): SubagentState | undefined {
-	const agentId = typeof event.id === "string" ? event.id : undefined;
-	const mappedToolCallId = agentId ? subagentByAgentId.get(agentId) : undefined;
-	if (mappedToolCallId) return subagentStates.get(mappedToolCallId);
-
-	const type = typeof event.type === "string" ? event.type : undefined;
-	const description = typeof event.description === "string" ? event.description : undefined;
-	const active = [...subagentStates.values()].filter((state) => isSubagentActive(state) && !state.agentId);
-	const shortDescription = description ? oneLine(description, 36) : undefined;
-	const exact = active.filter((state) =>
-		(!type || state.type === type) && (!shortDescription || state.description === shortDescription),
-	);
-	const descriptionMatches = shortDescription
-		? active.filter((state) => state.description === shortDescription)
-		: [];
-	const typeMatches = type ? active.filter((state) => state.type === type) : [];
-	const candidate = exact.length === 1
-		? exact[0]
-		: descriptionMatches.length === 1
-			? descriptionMatches[0]
-			: typeMatches.length === 1
-				? typeMatches[0]
-				: active.length === 1
-					? active[0]
-					: undefined;
-	if (!candidate) return undefined;
-	if (agentId) linkSubagentAgent(candidate, agentId);
-	return candidate;
-}
-
-function applySubagentLifecycle(channel: string, event: SubagentEvent): void {
-	const state = subagentEventState(event);
-	if (!state) return;
-
-	if (channel === "subagents:created") {
-		if (state.status !== "running") state.status = "queued";
-	}
-	else if (channel === "subagents:started") {
-		if (state.status === "queued" || state.status === "background") state.startedAt = Date.now();
-		state.status = "running";
-	}
-	else if (channel === "subagents:completed") state.status = "completed";
-	else if (channel === "subagents:failed") state.status = terminalSubagentStatus(event.status) ?? "failed";
-	else return;
-
-	const toolUses = finiteNumber(event.toolUses);
-	if (toolUses !== undefined) state.toolUses = Math.max(0, Math.floor(toolUses));
-	const durationMs = finiteNumber(event.durationMs);
-	if (durationMs !== undefined) state.durationMs = Math.max(0, durationMs);
-	if (typeof event.error === "string" && event.error.trim()) state.error = oneLine(event.error, 56);
-	if (!isSubagentActive(state)) state.completedAt ??= Date.now();
-	state.invalidate?.();
-	refreshSubagentTimer();
-}
-
-function extractResultError(result: unknown): string | undefined {
-	const record = asRecord(result);
-	if (!Array.isArray(record?.content)) return undefined;
-	const blocks = record.content.filter((block): block is TextBlock => {
-		const value = asRecord(block);
-		return typeof value?.type === "string" && typeof value.text === "string";
-	});
-	if (blocks.length === 0) return undefined;
-	return firstTextLine({ content: blocks });
-}
-
-function updateSubagentResult(
-	toolCallId: string,
-	args: unknown,
-	result: unknown,
-	isPartial: boolean,
-	isError: boolean,
-	context: RenderContext,
-): void {
-	const state = subagentStates.get(toolCallId) ?? createSubagentState(
-		toolCallId,
-		args,
-		isPartial ? "running" : isError ? "failed" : "completed",
-		undefined,
-	);
-	state.invalidate = context.invalidate;
-	const record = asRecord(result);
-	applySubagentDetails(state, record?.details);
-
-	if (isError) {
-		state.status = "failed";
-		state.error = extractResultError(result) ?? state.error;
-		state.completedAt ??= Date.now();
-	} else if (isPartial) {
-		if (isSubagentActive(state)) state.status = "running";
-	} else if (
-		asRecord(record?.details)?.status === "background" ||
-		state.status === "background" ||
-		state.backgroundRequested && record?.details === undefined
-	) {
-		if (state.status !== "running" && state.status !== "queued") state.status = "background";
-	} else if (state.status !== "failed" && state.status !== "stopped") {
-		state.status = "completed";
-		state.completedAt ??= Date.now();
-	}
-
-	refreshSubagentTimer();
-}
-
-function formatSubagentDuration(state: SubagentState): string {
-	const elapsed = state.durationMs ?? Math.max(0, (state.completedAt ?? Date.now()) - state.startedAt);
-	return `${(elapsed / 1_000).toFixed(1)}s`;
-}
-
-function subagentStatusLabel(state: SubagentState): string {
-	if (state.status === "queued") return "queued";
-	if (state.status === "running") return state.activity ?? "working…";
-	if (state.status === "background") return state.activity ?? "background";
-	if (state.status === "completed") return "done";
-	if (state.status === "stopped") return "stopped";
-	return state.error ? `failed: ${state.error}` : "failed";
-}
-
-function renderSubagentCall(args: unknown, theme: Theme, context: RenderContext): Text {
-	const toolCallId = context.toolCallId ?? "subagent";
-	const state = subagentStates.get(toolCallId) ?? createSubagentState(
-		toolCallId,
-		args,
-		context.isPartial ? "running" : context.isError ? "failed" : "completed",
-		undefined,
-		false,
-	);
-	state.invalidate = context.invalidate;
-	const titleText = state.type === "Agent" ? "Agent" : `Agent ${state.type}`;
-	const title = theme.fg("toolTitle", theme.bold(titleText));
-	const parts = [state.description, state.model ?? "model?", formatSubagentDuration(state)];
-	if (state.toolUses && state.toolUses > 0) parts.push(`${state.toolUses} tools`);
-	parts.push(subagentStatusLabel(state));
-	const icon = state.status === "failed" ? "✗" : state.status === "completed" ? "●" : "○";
-	const iconColor = state.status === "failed" ? "error" : state.status === "completed" ? "success" : "muted";
-	const summaryColor = state.status === "failed" ? "error" : "accent";
-	return toolText(`${theme.fg(iconColor, icon)} ${title} ${theme.fg(summaryColor, parts.filter(Boolean).join(" · "))}`);
-}
-
-function renderSubagentResult(
-	result: TextResult,
-	options: { expanded: boolean },
-	theme: Theme,
-	context: RenderContext,
-): Text {
-	const toolCallId = context.toolCallId ?? "subagent";
-	updateSubagentResult(toolCallId, context.args, result, context.isPartial, context.isError, context);
-	if (context.isPartial || !options.expanded) return emptyText();
-
-	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
-	if (!raw) return emptyText();
-	return toolText(branchBlock(theme.fg(context.isError ? "error" : "toolOutput", raw), theme));
-}
-
-function registerSubagentTracking(pi: ExtensionAPI): void {
-	pi.on("tool_execution_start", async (event, ctx) => {
-		if (ctx.hasUI === false) return;
-		if (event.toolName !== "Agent") return;
-		const backgroundRequested = asRecord(event.args)?.run_in_background === true;
-		const state = subagentStates.get(event.toolCallId) ?? createSubagentState(
-			event.toolCallId,
-			event.args,
-			backgroundRequested ? "queued" : "running",
-			compactModel(stringArg(event.args, "model")) ?? compactModel(ctx.model),
-		);
-		state.type = subagentType(event.args);
-		state.description = subagentDescription(event.args);
-		state.backgroundRequested = backgroundRequested;
-		if (backgroundRequested && state.status === "running") state.status = "queued";
-		state.model ??= compactModel(ctx.model);
-		ensureSubagentTimer();
-	});
-
-	pi.on("tool_execution_update", async (event, _ctx) => {
-		if (_ctx.hasUI === false) return;
-		if (event.toolName !== "Agent") return;
-		const result = event.partialResult as unknown;
-		updateSubagentResult(event.toolCallId, event.args, result, true, false, {
-			cwd: process.cwd(),
-			isPartial: true,
-			isError: false,
-		});
-	});
-
-	pi.on("tool_execution_end", async (event, _ctx) => {
-		if (_ctx.hasUI === false) return;
-		if (event.toolName !== "Agent") return;
-		const state = subagentStates.get(event.toolCallId);
-		if (!state) return;
-		updateSubagentResult(event.toolCallId, {}, event.result, false, event.isError, {
-			cwd: process.cwd(),
-			isPartial: false,
-			isError: event.isError,
-		});
-	});
-
-	const events = (pi as unknown as {
-		events?: { on?: (channel: string, handler: (data: unknown) => void) => unknown };
-	}).events;
-	if (!events?.on) return;
-	// pi-subagents publishes background lifecycle events on Pi's shared bus.
-	for (const channel of ["subagents:created", "subagents:started", "subagents:completed", "subagents:failed"]) {
-		events.on(channel, (data) => applySubagentLifecycle(channel, asRecord(data) ?? {}));
-	}
 }
 
 const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
@@ -461,6 +99,10 @@ function patchAssistantThinkingLabel(): void {
 // ── caches ──
 const settingsCache = new Map<string, SettingsFile>();
 const toolCache = new Map<string, ReturnType<typeof createBuiltInTools>>();
+
+function resetSettingsCache(): void {
+	settingsCache.clear();
+}
 
 function createBuiltInTools(cwd: string) {
 	return {
@@ -810,7 +452,18 @@ function renderMinimalResult(
 type DiffSummary = { added: number; removed: number; newFile: boolean };
 
 const WRITE_EDIT_DIFF = Symbol.for("pi-cc-tools:write-edit-diff");
+const WRITE_EDIT_RENDERED_DIFF = Symbol.for("pi-cc-tools:write-edit-rendered-diff");
+const FILE_DIFF_PREVIEW_LINES = 80;
+const DIFF_CONTEXT_LINES = 3;
 const MAX_LINE_DIFF_CELLS = 1_000_000;
+const MAX_DELTA_INPUT_BYTES = 500_000;
+const DELTA_TIMEOUT_MS = 2_000;
+const DELTA_SYNTAX_THEME_ALIASES: Record<string, string> = {
+	"catppuccin-frappe": "Catppuccin Frappe",
+	"catppuccin-latte": "Catppuccin Latte",
+	"catppuccin-macchiato": "Catppuccin Macchiato",
+	"catppuccin-mocha": "Catppuccin Mocha",
+};
 
 function splitTextLines(text: string): string[] {
 	if (!text) return [];
@@ -878,10 +531,222 @@ function summarizeEditResult(result: TextResult): DiffSummary | undefined {
 	return { added, removed, newFile: false };
 }
 
-function attachDiffSummary(result: TextResult, summary: DiffSummary): void {
+function diffRendererMode(cwd: string): DiffRenderer {
+	const override = process.env.PI_CC_TOOLS_DIFF_RENDERER;
+	if (override === "plain" || override === "delta" || override === "auto") return override;
+	const setting = readSettings(cwd).diffRenderer;
+	return setting === "delta" || setting === "auto" ? setting : "plain";
+}
+
+function formatTextChangeDiff(beforeText: string, afterText: string, newFile: boolean): string | undefined {
+	const before = splitTextLines(beforeText);
+	const after = splitTextLines(afterText);
+	if (!newFile && before.length === after.length && before.every((line, index) => line === after[index])) {
+		return undefined;
+	}
+
+	const lines: string[] = [];
+	let truncated = false;
+	const push = (line: string) => {
+		if (lines.length < DEFAULT_EXPANDED_LINES) lines.push(line);
+		else truncated = true;
+	};
+	const pushEllipsis = () => {
+		if (lines.at(-1) !== "…") push("…");
+	};
+
+	if (newFile) {
+		for (let index = 0; index < after.length; index++) push(`+${index + 1} ${after[index]}`);
+		if (truncated) pushEllipsis();
+		return lines.join("\n");
+	}
+
+	let start = 0;
+	while (start < before.length && start < after.length && before[start] === after[start]) start++;
+
+	let beforeEnd = before.length;
+	let afterEnd = after.length;
+	while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+		beforeEnd--;
+		afterEnd--;
+	}
+
+	const contextStart = Math.max(0, start - DIFF_CONTEXT_LINES);
+	if (contextStart > 0) pushEllipsis();
+	for (let index = contextStart; index < start; index++) push(` ${index + 1} ${before[index]}`);
+	for (let index = start; index < beforeEnd; index++) push(`-${index + 1} ${before[index]}`);
+	for (let index = start; index < afterEnd; index++) push(`+${index + 1} ${after[index]}`);
+
+	const contextEnd = Math.min(after.length, afterEnd + DIFF_CONTEXT_LINES);
+	for (let index = afterEnd; index < contextEnd; index++) push(` ${index + 1} ${after[index]}`);
+	if (contextEnd < after.length || truncated) pushEllipsis();
+	return lines.join("\n");
+}
+
+function formatUnifiedPatch(path: string, beforeText: string, afterText: string, newFile: boolean): string | undefined {
+	const before = splitTextLines(beforeText);
+	const after = splitTextLines(afterText);
+	if (!newFile && before.length === after.length && before.every((line, index) => line === after[index])) {
+		return undefined;
+	}
+
+	if (newFile) {
+		return [
+			"--- /dev/null",
+			`+++ b/${path}`,
+			`@@ -0,0 +1,${after.length} @@`,
+			...after.map((line) => `+${line}`),
+		].join("\n");
+	}
+
+	let start = 0;
+	while (start < before.length && start < after.length && before[start] === after[start]) start++;
+
+	let beforeEnd = before.length;
+	let afterEnd = after.length;
+	while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+		beforeEnd--;
+		afterEnd--;
+	}
+
+	const contextStart = Math.max(0, start - DIFF_CONTEXT_LINES);
+	const beforeContextEnd = Math.min(before.length, beforeEnd + DIFF_CONTEXT_LINES);
+	const afterContextEnd = Math.min(after.length, afterEnd + DIFF_CONTEXT_LINES);
+	const oldStart = contextStart + 1;
+	const newStart = contextStart + 1;
+	const oldCount = Math.max(0, beforeContextEnd - contextStart);
+	const newCount = Math.max(0, afterContextEnd - contextStart);
+	const lines = [
+		`--- a/${path}`,
+		`+++ b/${path}`,
+		`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`,
+	];
+	for (let index = contextStart; index < start; index++) lines.push(` ${before[index]}`);
+	for (let index = start; index < beforeEnd; index++) lines.push(`-${before[index]}`);
+	for (let index = start; index < afterEnd; index++) lines.push(`+${after[index]}`);
+	for (let index = afterEnd; index < afterContextEnd; index++) lines.push(` ${after[index]}`);
+	return lines.join("\n");
+}
+
+function deltaSyntaxTheme(cwd: string): string | undefined {
+	const themeName = readSettings(cwd).diffTheme;
+	if (!themeName) return undefined;
+	return DELTA_SYNTAX_THEME_ALIASES[themeName] ?? themeName;
+}
+
+function compactDeltaOutput(output: string): string | undefined {
+	const compact = output.trim();
+	return compact ? compact : undefined;
+}
+
+function renderDeltaPatch(patch: string, cwd: string): Promise<string | undefined> {
+	if (diffRendererMode(cwd) === "plain" || Buffer.byteLength(patch, "utf8") > MAX_DELTA_INPUT_BYTES) {
+		return Promise.resolve(undefined);
+	}
+
+	const syntaxTheme = deltaSyntaxTheme(cwd);
+	const args = [
+		"--no-gitconfig",
+		"--paging=never",
+		"--file-style=omit",
+		"--hunk-header-style=omit",
+		"--line-numbers",
+		"--keep-plus-minus-markers",
+		"--width=variable",
+		...(syntaxTheme ? [`--syntax-theme=${syntaxTheme}`] : []),
+	];
+
+	return new Promise((resolveDelta) => {
+		const child = spawn("delta", args, {
+			cwd,
+			env: { ...process.env, NO_COLOR: undefined },
+			stdio: ["pipe", "pipe", "ignore"],
+		});
+		let output = "";
+		let settled = false;
+		const finish = (value: string | undefined) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolveDelta(value);
+		};
+		const timeout = setTimeout(() => {
+			child.kill();
+			finish(undefined);
+		}, DELTA_TIMEOUT_MS);
+		(child as unknown as { unref?: () => void }).unref?.();
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			output += chunk;
+		});
+		child.stdout.on("error", () => finish(undefined));
+		child.stdin.on("error", () => undefined);
+		child.on("error", () => finish(undefined));
+		child.on("close", (code) => finish(code === 0 ? compactDeltaOutput(output) : undefined));
+		child.stdin.end(patch);
+	});
+}
+
+function extractPatch(result: TextResult): string | undefined {
+	const details = result.details && typeof result.details === "object"
+		? result.details as { patch?: unknown }
+		: undefined;
+	return typeof details?.patch === "string" && details.patch.trim() ? details.patch : undefined;
+}
+
+async function renderDeltaForPatch(patch: string | undefined, cwd: string): Promise<string | undefined> {
+	return patch ? renderDeltaPatch(patch, cwd) : undefined;
+}
+
+function attachDiffSummary(result: TextResult, summary: DiffSummary, diff?: string, renderedDiff?: string): void {
 	const details = result.details && typeof result.details === "object" ? result.details : {};
 	(details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] = summary;
+	if (diff) (details as { diff?: string }).diff = diff;
+	if (renderedDiff) (details as Record<PropertyKey, unknown>)[WRITE_EDIT_RENDERED_DIFF] = renderedDiff;
 	(result as { details?: unknown }).details = details;
+}
+
+function diffSummaryLine(summary: DiffSummary | undefined, theme: Theme): string | undefined {
+	if (!summary) return undefined;
+
+	const parts: string[] = [];
+	if (summary.newFile) parts.push(theme.fg("muted", "new file"));
+	if (summary.added > 0) parts.push(theme.fg("success", `+${summary.added}`));
+	if (summary.removed > 0) parts.push(theme.fg("error", `-${summary.removed}`));
+	if (summary.added === 0 && summary.removed === 0) parts.push(theme.fg("muted", "unchanged"));
+	return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+function editDiff(result: TextResult): string | undefined {
+	const details = result.details && typeof result.details === "object"
+		? result.details as { diff?: unknown }
+		: undefined;
+	return typeof details?.diff === "string" && details.diff.trim() ? details.diff : undefined;
+}
+
+function renderedDiff(result: TextResult): string | undefined {
+	return result.details && typeof result.details === "object"
+		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_RENDERED_DIFF] as string | undefined
+		: undefined;
+}
+
+function colorDiffText(diff: string, theme: Theme, maxLines: number): string {
+	const limited = takeLines(diff, maxLines).text;
+	return limited
+		.split("\n")
+		.map((line) => {
+			if (line.startsWith("+")) return theme.fg("success", line);
+			if (line.startsWith("-")) return theme.fg("error", line);
+			if (line.startsWith("@") || line === "…") return theme.fg("muted", line);
+			return theme.fg("toolOutput", line);
+		})
+		.join("\n");
+}
+
+function writeEditSummary(result: TextResult): DiffSummary | undefined {
+	return result.details && typeof result.details === "object"
+		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] as DiffSummary | undefined
+		: undefined;
 }
 
 function renderWriteEditResult(
@@ -892,9 +757,7 @@ function renderWriteEditResult(
 ): Text {
 	if (context.isPartial) return emptyText();
 
-	const summary = result.details && typeof result.details === "object"
-		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] as DiffSummary | undefined
-		: undefined;
+	const summary = writeEditSummary(result);
 
 	if (context.isError) {
 		const raw = options.expanded
@@ -904,15 +767,18 @@ function renderWriteEditResult(
 		return toolText(branchBlock(theme.fg("error", raw), theme));
 	}
 
+	const diff = renderedDiff(result) ?? editDiff(result);
+	if (diff) {
+		const maxLines = options.expanded ? DEFAULT_EXPANDED_LINES : FILE_DIFF_PREVIEW_LINES;
+		const diffOutput = renderedDiff(result) ? takeLines(diff, maxLines).text : colorDiffText(diff, theme, maxLines);
+		const output = [diffSummaryLine(summary, theme), diffOutput].filter(Boolean).join("\n");
+		return toolText(branchBlock(output, theme));
+	}
+
 	if (!options.expanded) {
-		if (!summary) return renderMinimalResult(result, options.expanded, theme, context);
-		const parts: string[] = [];
-		if (summary.newFile) parts.push(theme.fg("muted", "new file"));
-		if (summary.added > 0) parts.push(theme.fg("success", `+${summary.added}`));
-		if (summary.removed > 0) parts.push(theme.fg("error", `-${summary.removed}`));
-		if (summary.added === 0 && summary.removed === 0) parts.push(theme.fg("muted", "unchanged"));
-		if (parts.length === 0) return emptyText();
-		return toolText(branchBlock(parts.join(" "), theme));
+		const line = diffSummaryLine(summary, theme);
+		if (!line) return renderMinimalResult(result, options.expanded, theme, context);
+		return toolText(branchBlock(line, theme));
 	}
 
 	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
@@ -984,9 +850,10 @@ function renderGenericResult(
 }
 
 const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
+const NATIVE_RENDERER_TOOL_NAMES = new Set([...BUILT_IN_TOOL_NAMES, "Agent"]);
 
 function keepsOwnRenderer(name: string): boolean {
-	return BUILT_IN_TOOL_NAMES.has(name) || name === "todo";
+	return NATIVE_RENDERER_TOOL_NAMES.has(name) || name === "todo";
 }
 
 function patchUnknownToolRendering(): void {
@@ -997,7 +864,7 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalShell === "function") {
 		prototype.getRenderShell = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (!BUILT_IN_TOOL_NAMES.has(name)) return "self";
+			if (!NATIVE_RENDERER_TOOL_NAMES.has(name)) return "self";
 			return Reflect.apply(originalShell, this, []);
 		};
 	}
@@ -1006,10 +873,6 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalCall === "function") {
 		prototype.getCallRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (name === "Agent") {
-				return (args: unknown, theme: Theme, context: RenderContext) =>
-					renderSubagentCall(args, theme, context);
-			}
 			if (keepsOwnRenderer(name)) {
 				const renderer = Reflect.apply(originalCall, this, []) as
 					| ((...args: unknown[]) => Component)
@@ -1026,10 +889,6 @@ function patchUnknownToolRendering(): void {
 	if (typeof originalResult === "function") {
 		prototype.getResultRenderer = function (this: { toolName?: unknown }) {
 			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (name === "Agent") {
-				return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
-					renderSubagentResult(result, options, theme, context);
-			}
 			if (keepsOwnRenderer(name)) {
 				const renderer = Reflect.apply(originalResult, this, []) as
 					| ((...args: unknown[]) => Component)
@@ -1162,9 +1021,17 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 				if (existed) previousContent = readFileSync(absPath, "utf-8");
 			} catch { /* Keep the write usable when the old file cannot be read. */ }
 
+			const newContent = stringArg(params, "content");
 			const result = await getBuiltInTools(ctx.cwd).write.execute(toolCallId, params, signal, onUpdate);
 
-			attachDiffSummary(result, summarizeTextChange(previousContent, stringArg(params, "content"), !existed));
+			const plainDiff = formatTextChangeDiff(previousContent, newContent, !existed);
+			const patch = formatUnifiedPatch(fp, previousContent, newContent, !existed);
+			attachDiffSummary(
+				result,
+				summarizeTextChange(previousContent, newContent, !existed),
+				plainDiff,
+				await renderDeltaForPatch(patch, ctx.cwd),
+			);
 			return result;
 		},
 		renderCall(args, theme, context) {
@@ -1182,7 +1049,7 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const result = await getBuiltInTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate);
 			const summary = summarizeEditResult(result);
-			if (summary) attachDiffSummary(result, summary);
+			if (summary) attachDiffSummary(result, summary, undefined, await renderDeltaForPatch(extractPatch(result), ctx.cwd));
 			return result;
 		},
 		renderCall(args, theme, context) {
@@ -1206,20 +1073,21 @@ export default function (pi: ExtensionAPI): void {
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
 	registerBuiltInTools(pi);
-	registerSubagentTracking(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
+		resetSettingsCache();
 		thinkingStates.clear();
-		if (ctx.hasUI) resetSubagentTracking();
 		configureMinimalUi(ctx);
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
+		resetSettingsCache();
 		configureMinimalUi(ctx);
 	});
 	pi.on("agent_start", async (_event, ctx) => {
 		configureMinimalUi(ctx);
 	});
 	pi.on("turn_start", async (_event, ctx) => {
+		resetSettingsCache();
 		configureMinimalUi(ctx);
 	});
 	pi.on("agent_end", async (_event, ctx) => {
