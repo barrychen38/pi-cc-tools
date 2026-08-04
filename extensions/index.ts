@@ -143,7 +143,10 @@ function stripSkillFrontmatter(content: string): string {
 	return content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
 }
 
-function expandSkillReferences(text: string, commands: readonly { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[]): string {
+function collectReferencedSkillBlocks(
+	text: string,
+	commands: readonly { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[],
+): string[] {
 	const skills = new Map<string, { filePath: string; baseDir: string }>();
 	for (const command of commands) {
 		if (command.source !== "skill" || !command.name.startsWith(SKILL_COMMAND_PREFIX)) continue;
@@ -154,19 +157,34 @@ function expandSkillReferences(text: string, commands: readonly { name: string; 
 			baseDir: command.sourceInfo.baseDir ?? dirname(command.sourceInfo.path),
 		});
 	}
-	if (skills.size === 0) return text;
+	if (skills.size === 0) return [];
 
-	return text.replace(SKILL_TOKEN_PATTERN, (match, prefix: string, skillName: string) => {
+	const blocks: string[] = [];
+	const seen = new Set<string>();
+	for (const match of text.matchAll(SKILL_TOKEN_PATTERN)) {
+		const skillName = match[2];
+		if (!skillName || seen.has(skillName)) continue;
 		const skill = skills.get(skillName);
-		if (!skill) return match;
+		if (!skill) continue;
+		seen.add(skillName);
 		try {
 			const body = stripSkillFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
-			const skillBlock = `<skill name="${skillName}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
-			return `${prefix}${skillBlock}`;
+			blocks.push(`<skill name="${skillName}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`);
 		} catch {
-			return match;
+			// Keep the user prompt unchanged if an optional skill file cannot be read.
 		}
-	});
+	}
+	return blocks;
+}
+
+function appendReferencedSkillsToSystemPrompt(
+	systemPrompt: string,
+	text: string,
+	commands: readonly { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[],
+): string | undefined {
+	const blocks = collectReferencedSkillBlocks(text, commands);
+	if (blocks.length === 0) return undefined;
+	return `${systemPrompt}\n\n<referenced_skills>\nThe user referenced these skills with $name tokens in their prompt. Apply the matching skill instructions while preserving the user's original wording as the task request.\n\n${blocks.join("\n\n")}\n</referenced_skills>`;
 }
 
 function patchSkillAutocomplete(): void {
@@ -1287,9 +1305,12 @@ export default function (pi: ExtensionAPI): void {
 		thinkingStates.clear();
 		configureMinimalUi(ctx);
 	});
-	pi.on("before_agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		resetSettingsCache();
 		configureMinimalUi(ctx);
+		if (typeof event.prompt !== "string" || typeof event.systemPrompt !== "string" || !event.prompt.includes(SKILL_TRIGGER)) return;
+		const systemPrompt = appendReferencedSkillsToSystemPrompt(event.systemPrompt, event.prompt, pi.getCommands());
+		return systemPrompt ? { systemPrompt } : undefined;
 	});
 	pi.on("agent_start", async (_event, ctx) => {
 		configureMinimalUi(ctx);
@@ -1301,16 +1322,6 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
 		ctx.ui.setWorkingVisible(false);
-	});
-
-	pi.on("input", async (event) => {
-		if (event.source === "extension" || !event.text.includes(SKILL_TRIGGER)) {
-			return { action: "continue" };
-		}
-		const expandedText = expandSkillReferences(event.text, pi.getCommands());
-		return expandedText === event.text
-			? { action: "continue" }
-			: { action: "transform", text: expandedText, images: event.images };
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
