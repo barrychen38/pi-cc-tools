@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -16,7 +16,15 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { Spacer, Text, type Component } from "@earendil-works/pi-tui";
+import {
+	CombinedAutocompleteProvider,
+	Editor,
+	Spacer,
+	Text,
+	type AutocompleteItem,
+	type AutocompleteSuggestions,
+	type Component,
+} from "@earendil-works/pi-tui";
 
 type TextBlock = { type: string; text?: string };
 type TextResult = { content: readonly TextBlock[]; details?: unknown };
@@ -67,6 +75,192 @@ function formatThinkDuration(ms: number): string {
 }
 
 const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
+const SKILL_AUTOCOMPLETE_PATCH = Symbol.for("pi-cc-tools:skill-autocomplete");
+const SKILL_TRIGGER = "$";
+const SKILL_COMMAND_PREFIX = "skill:";
+const SKILL_COMMAND_COLOR = "\x1b[38;5;141m";
+const RESET_FG = "\x1b[39m";
+const SKILL_TOKEN_DELIMITERS = new Set([" ", "\t", "\"", "'", "=", "(", "[", "{"]);
+const SKILL_NAME_PATTERN = /^[A-Za-z0-9._-]*$/;
+const SKILL_TOKEN_PATTERN = /(^|[\s"'=([{])\$([A-Za-z0-9][A-Za-z0-9._-]*)(?=$|[\s.,;:!?，。；：！？)\]}'"])/g;
+const skillNamesForDisplay = new Set<string>();
+
+type SkillAutocompleteProvider = {
+	commands?: readonly (AutocompleteItem | { name: string; description?: string })[];
+	triggerCharacters?: string[];
+};
+
+type EditorPatch = {
+	state?: { lines?: string[]; cursorLine?: number; cursorCol?: number };
+	render: (width: number) => string[];
+};
+
+function commandName(command: AutocompleteItem | { name: string }): string {
+	return "name" in command ? command.name : command.value;
+}
+
+function isSkillTokenBoundary(text: string, index: number): boolean {
+	return index === 0 || SKILL_TOKEN_DELIMITERS.has(text[index - 1] ?? "");
+}
+
+function skillTriggerContext(textBeforeCursor: string): { text: string; query: string } | undefined {
+	for (let index = textBeforeCursor.length - 1; index >= 0; index--) {
+		if (textBeforeCursor[index] !== SKILL_TRIGGER || !isSkillTokenBoundary(textBeforeCursor, index)) continue;
+		const query = textBeforeCursor.slice(index + 1);
+		if (!SKILL_NAME_PATTERN.test(query)) return undefined;
+		return { text: textBeforeCursor.slice(index), query };
+	}
+	return undefined;
+}
+
+function skillAutocompleteItems(provider: unknown, query: string): AutocompleteItem[] {
+	const commands = (provider as SkillAutocompleteProvider).commands ?? [];
+	const normalizedQuery = query.toLowerCase();
+	const items: AutocompleteItem[] = [];
+	for (const command of commands) {
+		const name = commandName(command);
+		if (!name.startsWith(SKILL_COMMAND_PREFIX)) continue;
+		const skillName = name.slice(SKILL_COMMAND_PREFIX.length);
+		skillNamesForDisplay.add(skillName);
+		if (normalizedQuery && !skillName.toLowerCase().includes(normalizedQuery)) continue;
+		items.push({
+			value: skillName,
+			label: skillName,
+			description: command.description,
+		});
+	}
+	return items.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function colorKnownSkillTokens(line: string): string {
+	return line.replace(SKILL_TOKEN_PATTERN, (match, prefix: string, skillName: string) => {
+		if (!skillNamesForDisplay.has(skillName)) return match;
+		return `${prefix}${SKILL_COMMAND_COLOR}$${skillName}${RESET_FG}`;
+	});
+}
+
+function stripSkillFrontmatter(content: string): string {
+	return content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+}
+
+function expandSkillReferences(text: string, commands: readonly { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[]): string {
+	const skills = new Map<string, { filePath: string; baseDir: string }>();
+	for (const command of commands) {
+		if (command.source !== "skill" || !command.name.startsWith(SKILL_COMMAND_PREFIX)) continue;
+		const skillName = command.name.slice(SKILL_COMMAND_PREFIX.length);
+		skillNamesForDisplay.add(skillName);
+		skills.set(skillName, {
+			filePath: command.sourceInfo.path,
+			baseDir: command.sourceInfo.baseDir ?? dirname(command.sourceInfo.path),
+		});
+	}
+	if (skills.size === 0) return text;
+
+	return text.replace(SKILL_TOKEN_PATTERN, (match, prefix: string, skillName: string) => {
+		const skill = skills.get(skillName);
+		if (!skill) return match;
+		try {
+			const body = stripSkillFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+			const skillBlock = `<skill name="${skillName}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+			return `${prefix}${skillBlock}`;
+		} catch {
+			return match;
+		}
+	});
+}
+
+function patchSkillAutocomplete(): void {
+	const editorPrototype = Editor.prototype as unknown as Record<PropertyKey, unknown>;
+	const providerPrototype = CombinedAutocompleteProvider.prototype as unknown as Record<PropertyKey, unknown>;
+	if (editorPrototype[SKILL_AUTOCOMPLETE_PATCH]) return;
+
+	(providerPrototype as SkillAutocompleteProvider).triggerCharacters = [SKILL_TRIGGER];
+
+	editorPrototype.isSlashMenuAllowed = function restoredIsSlashMenuAllowed(this: EditorPatch) {
+		return this.state?.cursorLine === 0;
+	};
+	editorPrototype.isAtStartOfMessage = function restoredIsAtStartOfMessage(this: EditorPatch) {
+		if (this.state?.cursorLine !== 0) return false;
+		const currentLine = this.state?.lines?.[0] ?? "";
+		const beforeCursor = currentLine.slice(0, this.state.cursorCol ?? 0);
+		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
+	};
+	editorPrototype.isInSlashCommandContext = function restoredIsInSlashCommandContext(this: EditorPatch, textBeforeCursor: string) {
+		return this.state?.cursorLine === 0 && textBeforeCursor.trimStart().startsWith("/");
+	};
+
+	const originalRender = editorPrototype.render as EditorPatch["render"] | undefined;
+	if (typeof originalRender === "function") {
+		editorPrototype.render = function patchedRender(this: EditorPatch, width: number) {
+			return originalRender.call(this, width).map(colorKnownSkillTokens);
+		};
+	}
+
+	const originalGetSuggestions = providerPrototype.getSuggestions as
+		| ((
+			this: unknown,
+			lines: string[],
+			cursorLine: number,
+			cursorCol: number,
+			options: { signal: AbortSignal; force?: boolean },
+		) => Promise<AutocompleteSuggestions | null>)
+		| undefined;
+	if (typeof originalGetSuggestions === "function") {
+		providerPrototype.getSuggestions = async function patchedGetSuggestions(
+			this: unknown,
+			lines: string[],
+			cursorLine: number,
+			cursorCol: number,
+			options: { signal: AbortSignal; force?: boolean },
+		): Promise<AutocompleteSuggestions | null> {
+			const currentLine = lines[cursorLine] ?? "";
+			const context = skillTriggerContext(currentLine.slice(0, cursorCol));
+			if (context) {
+				const items = skillAutocompleteItems(this, context.query);
+				return items.length > 0 ? { items, prefix: context.text } : null;
+			}
+			return originalGetSuggestions.call(this, lines, cursorLine, cursorCol, options);
+		};
+	}
+
+	const originalApplyCompletion = providerPrototype.applyCompletion as
+		| ((
+			this: unknown,
+			lines: string[],
+			cursorLine: number,
+			cursorCol: number,
+			item: AutocompleteItem,
+			prefix: string,
+		) => { lines: string[]; cursorLine: number; cursorCol: number })
+		| undefined;
+	if (typeof originalApplyCompletion === "function") {
+		providerPrototype.applyCompletion = function patchedApplyCompletion(
+			this: unknown,
+			lines: string[],
+			cursorLine: number,
+			cursorCol: number,
+			item: AutocompleteItem,
+			prefix: string,
+		) {
+			if (prefix.startsWith(SKILL_TRIGGER)) {
+				const currentLine = lines[cursorLine] ?? "";
+				const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
+				const afterCursor = currentLine.slice(cursorCol);
+				const newLines = [...lines];
+				newLines[cursorLine] = `${beforePrefix}$${item.value} ${afterCursor}`;
+				skillNamesForDisplay.add(item.value);
+				return {
+					lines: newLines,
+					cursorLine,
+					cursorCol: beforePrefix.length + item.value.length + 2,
+				};
+			}
+			return originalApplyCompletion.call(this, lines, cursorLine, cursorCol, item, prefix);
+		};
+	}
+
+	editorPrototype[SKILL_AUTOCOMPLETE_PATCH] = true;
+}
 
 function patchAssistantThinkingLabel(): void {
 	const proto = AssistantMessageComponent.prototype as unknown as Record<PropertyKey, unknown>;
@@ -464,6 +658,15 @@ const DELTA_SYNTAX_THEME_ALIASES: Record<string, string> = {
 	"catppuccin-macchiato": "Catppuccin Macchiato",
 	"catppuccin-mocha": "Catppuccin Mocha",
 };
+const DELTA_STYLE_ARGS: Record<string, string[]> = {
+	"Catppuccin Macchiato": [
+		"--minus-style=syntax #4c3a4c",
+		"--minus-emph-style=bold syntax #6a485a",
+		"--plus-style=syntax #3e4b4c",
+		"--plus-emph-style=bold syntax #51655a",
+		"--zero-style=syntax",
+	],
+};
 
 function splitTextLines(text: string): string[] {
 	if (!text) return [];
@@ -634,6 +837,10 @@ function deltaSyntaxTheme(cwd: string): string | undefined {
 	return DELTA_SYNTAX_THEME_ALIASES[themeName] ?? themeName;
 }
 
+function deltaStyleArgs(syntaxTheme: string | undefined): string[] {
+	return syntaxTheme ? DELTA_STYLE_ARGS[syntaxTheme] ?? [] : [];
+}
+
 function compactDeltaOutput(output: string): string | undefined {
 	const compact = output.trim();
 	return compact ? compact : undefined;
@@ -650,10 +857,10 @@ function renderDeltaPatch(patch: string, cwd: string): Promise<string | undefine
 		"--paging=never",
 		"--file-style=omit",
 		"--hunk-header-style=omit",
-		"--line-numbers",
 		"--keep-plus-minus-markers",
 		"--width=variable",
 		...(syntaxTheme ? [`--syntax-theme=${syntaxTheme}`] : []),
+		...deltaStyleArgs(syntaxTheme),
 	];
 
 	return new Promise((resolveDelta) => {
@@ -1067,6 +1274,7 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI): void {
+	patchSkillAutocomplete();
 	patchFirstMessageSpacing();
 	patchEmptyWidgetSpacing();
 	patchTodoWidgetIndent();
@@ -1093,6 +1301,16 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
 		ctx.ui.setWorkingVisible(false);
+	});
+
+	pi.on("input", async (event) => {
+		if (event.source === "extension" || !event.text.includes(SKILL_TRIGGER)) {
+			return { action: "continue" };
+		}
+		const expandedText = expandSkillReferences(event.text, pi.getCommands());
+		return expandedText === event.text
+			? { action: "continue" }
+			: { action: "transform", text: expandedText, images: event.images };
 	});
 
 	pi.on("message_update", async (event, _ctx) => {

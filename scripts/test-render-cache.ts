@@ -527,7 +527,10 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		assert(deltaArgs.includes("--no-gitconfig"), `delta did not ignore verbose user config: ${deltaArgs}`);
 		assert(deltaArgs.includes("--file-style=omit"), `delta did not omit file header: ${deltaArgs}`);
 		assert(deltaArgs.includes("--hunk-header-style=omit"), `delta did not omit hunk header: ${deltaArgs}`);
-		assert(deltaArgs.includes("--line-numbers"), `delta did not keep line numbers: ${deltaArgs}`);
+		assert(!deltaArgs.includes("--line-numbers"), `delta should not keep line numbers: ${deltaArgs}`);
+		assert(deltaArgs.includes("--syntax-theme=Catppuccin Macchiato"), `delta did not use Catppuccin syntax theme: ${deltaArgs}`);
+		assert(deltaArgs.includes("--minus-style=syntax #4c3a4c"), `delta did not use Catppuccin minus style: ${deltaArgs}`);
+		assert(deltaArgs.includes("--plus-style=syntax #3e4b4c"), `delta did not use Catppuccin plus style: ${deltaArgs}`);
 		assert(!deltaArgs.includes("--color-only"), `delta still uses structure-preserving color-only mode: ${deltaArgs}`);
 		console.log("OK  write/edit renderer: optional compact delta output is used when configured");
 	} finally {

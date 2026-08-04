@@ -33,7 +33,7 @@ Pi reads global settings from `~/.pi/agent/settings.json` and project settings f
 
 `toolBackground` accepts `default`, `transparent`, `outlines`, or the legacy alias `border`. The compact renderer removes full-width background fills for the non-default modes; it intentionally does not add border rows to the hot path.
 
-`diffRenderer` accepts `plain` (default), `delta`, or `auto`. `delta` / `auto` use a local `delta` executable for compact `write` / `edit` diff previews during tool execution, with file headers and hunk headers omitted while line numbers are kept. Rendering has a timeout and automatic fallback to plain diff when unavailable.
+`diffRenderer` accepts `plain` (default), `delta`, or `auto`. `delta` / `auto` use a local `delta` executable for compact `write` / `edit` diff previews during tool execution, with file headers, hunk headers, and delta line-number columns omitted. Catppuccin Macchiato diff colors are passed explicitly when `diffTheme` is `catppuccin-macchiato`. Rendering has a timeout and automatic fallback to plain diff when unavailable.
 
 Pi's own settings can be used alongside this extension to keep startup and thinking output quiet:
 
