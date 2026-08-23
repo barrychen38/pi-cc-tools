@@ -1079,7 +1079,7 @@ function renderGenericResult(
 
 const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
 const NATIVE_RENDERER_TOOL_NAMES = new Set([...BUILT_IN_TOOL_NAMES, "Agent"]);
-const GENERIC_RENDERER_PATCH_VERSION = 1;
+const GENERIC_RENDERER_PATCH_VERSION = 2;
 
 type ToolRenderer = (...args: never[]) => Component;
 type RendererMethod = (this: { toolName?: unknown }) => ToolRenderer | undefined;
@@ -1159,7 +1159,8 @@ function patchUnknownToolRendering(): void {
 		const name = typeof this.toolName === "string" ? this.toolName : "tool";
 		const renderer = Reflect.apply(originalCall, this, []) as ToolRenderer | undefined;
 		if (renderer) {
-			if (name !== "todo") return renderer;
+			const usesSelfShell = Reflect.apply(originalShell, this, []) === "self";
+			if (name !== "todo" && (!usesSelfShell || NATIVE_RENDERER_TOOL_NAMES.has(name))) return renderer;
 			return (...args: never[]) => new ToolIndent(renderer(...args));
 		}
 		if (keepsOwnRenderer(name)) return undefined;
@@ -1171,7 +1172,8 @@ function patchUnknownToolRendering(): void {
 		const name = typeof this.toolName === "string" ? this.toolName : "tool";
 		const renderer = Reflect.apply(originalResult, this, []) as ToolRenderer | undefined;
 		if (renderer) {
-			if (name !== "todo") return renderer;
+			const usesSelfShell = Reflect.apply(originalShell, this, []) === "self";
+			if (name !== "todo" && (!usesSelfShell || NATIVE_RENDERER_TOOL_NAMES.has(name))) return renderer;
 			return (...args: never[]) => new ToolIndent(renderer(...args));
 		}
 		if (keepsOwnRenderer(name)) return undefined;

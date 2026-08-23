@@ -170,7 +170,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 }
 
 // Registered custom renderers take precedence over the generic fallback.
-// pi-mcp-adapter relies on this path for its dedicated call/result UI.
+// Self-rendered MCP output keeps its dedicated UI but receives the shared indent.
 {
 	let callRendered = false;
 	let resultRendered = false;
@@ -199,7 +199,12 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(rendered.includes("Native MCP call"), `MCP native call missing: ${rendered}`);
 	assert(rendered.includes("Native MCP result"), `MCP native result missing: ${rendered}`);
 	assert(!rendered.includes("generic result must not render"), "MCP result fell back to generic output");
-	console.log("OK  MCP renderer: registered call/result/shell stay unchanged");
+	const visible = ensureArray(component.render(width)).map(stripAnsi).filter((line) => line.trim().length > 0);
+	assert(
+		visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")),
+		`MCP output did not use two-column indent: ${JSON.stringify(visible)}`,
+	);
+	console.log("OK  MCP renderer: native call/result use the shared two-column indent");
 }
 
 // If a custom tool only supplies one renderer, preserve it and fill the
