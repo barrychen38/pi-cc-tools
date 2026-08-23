@@ -418,12 +418,13 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  alignment: todo/custom shell is unboxed and starts at column 2");
 }
 
-// ── The rpiv-todo widget receives the same two-column indent ──
+// ── Todo and subagent widgets receive the same two-column indent ──
 {
 	const extensionWidgetsAbove = new Map<string, Component>();
+	const extensionWidgetsBelow = new Map<string, Component>();
 	const fakeInteractiveMode = {
 		extensionWidgetsAbove,
-		extensionWidgetsBelow: new Map<string, Component>(),
+		extensionWidgetsBelow,
 		ui: {},
 		renderWidgets() {},
 	};
@@ -434,17 +435,29 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 			options?: unknown,
 		): void;
 	}).setExtensionWidget;
-	setExtensionWidget.call(
-		fakeInteractiveMode,
-		"rpiv-todos",
-		() => new Text("● Todos (0/1)\n└─ ○ Queued", 0, 0),
-		{ placement: "aboveEditor" },
-	);
-	const widget = extensionWidgetsAbove.get("rpiv-todos");
-	assert(widget, "todo widget was not registered");
-	const visible = widget.render(width).map(stripAnsi).filter((line) => line.trim().length > 0);
-	assert(visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")), `todo widget did not use two-column indent: ${JSON.stringify(visible)}`);
-	console.log("OK  alignment: bottom todos widget starts at column 2");
+	const cases = [
+		{ key: "rpiv-todos", placement: "aboveEditor", text: "● Todos (0/1)\n└─ ○ Queued" },
+		{ key: "agents", placement: "aboveEditor", text: "● Explore scanning API" },
+		{ key: "fleet", placement: "belowEditor", text: "○ main\n○ Explore" },
+	] as const;
+
+	for (const testCase of cases) {
+		setExtensionWidget.call(
+			fakeInteractiveMode,
+			testCase.key,
+			() => new Text(testCase.text, 0, 0),
+			{ placement: testCase.placement },
+		);
+		const widgets = testCase.placement === "belowEditor" ? extensionWidgetsBelow : extensionWidgetsAbove;
+		const widget = widgets.get(testCase.key);
+		assert(widget, `${testCase.key} widget was not registered`);
+		const visible = widget.render(width).map(stripAnsi).filter((line) => line.trim().length > 0);
+		assert(
+			visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")),
+			`${testCase.key} widget did not use two-column indent: ${JSON.stringify(visible)}`,
+		);
+	}
+	console.log("OK  alignment: todo and subagent widgets start at column 2");
 }
 
 // ── Write/edit summaries count replacements and show changed lines ──

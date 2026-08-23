@@ -55,6 +55,9 @@ const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
 const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer");
 const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
 const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
+const SUBAGENT_WIDGET_PATCH = Symbol.for("pi-cc-tools:subagent-widget-indent");
+const TODO_WIDGET_KEYS = new Set(["rpiv-todos"]);
+const SUBAGENT_WIDGET_KEYS = new Set(["agents", "fleet"]);
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
@@ -495,9 +498,9 @@ class ToolIndent implements Component {
 	}
 }
 
-function patchTodoWidgetIndent(): void {
+function patchWidgetIndent(patch: symbol, widgetKeys: ReadonlySet<string>): void {
 	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
-	if (prototype[TODO_WIDGET_PATCH]) return;
+	if (prototype[patch]) return;
 
 	const original = prototype.setExtensionWidget;
 	if (typeof original !== "function") return;
@@ -508,16 +511,16 @@ function patchTodoWidgetIndent(): void {
 		options?: unknown,
 	) {
 		let indentedContent = content;
-		if (key === "rpiv-todos" && Array.isArray(content)) {
+		if (widgetKeys.has(key) && Array.isArray(content)) {
 			// Pi wraps string widgets in Text with one column of host padding.
 			const padding = " ".repeat(Math.max(0, TOOL_PADDING_X - 1));
 			indentedContent = content.map((line) => line ? `${padding}${line}` : line);
-		} else if (key === "rpiv-todos" && typeof content === "function") {
+		} else if (widgetKeys.has(key) && typeof content === "function") {
 			indentedContent = (...args: unknown[]) => new ToolIndent(Reflect.apply(content, undefined, args));
 		}
 		return Reflect.apply(original, this, [key, indentedContent, options]);
 	};
-	prototype[TODO_WIDGET_PATCH] = true;
+	prototype[patch] = true;
 }
 
 function oneLine(value: unknown, max = 72): string {
@@ -1295,7 +1298,8 @@ export default function (pi: ExtensionAPI): void {
 	patchSkillAutocomplete();
 	patchFirstMessageSpacing();
 	patchEmptyWidgetSpacing();
-	patchTodoWidgetIndent();
+	patchWidgetIndent(TODO_WIDGET_PATCH, TODO_WIDGET_KEYS);
+	patchWidgetIndent(SUBAGENT_WIDGET_PATCH, SUBAGENT_WIDGET_KEYS);
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
 	registerBuiltInTools(pi);
