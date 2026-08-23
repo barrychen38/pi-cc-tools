@@ -1079,57 +1079,122 @@ function renderGenericResult(
 
 const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
 const NATIVE_RENDERER_TOOL_NAMES = new Set([...BUILT_IN_TOOL_NAMES, "Agent"]);
+const GENERIC_RENDERER_PATCH_VERSION = 1;
+
+type ToolRenderer = (...args: never[]) => Component;
+type RendererMethod = (this: { toolName?: unknown }) => ToolRenderer | undefined;
+type ShellMethod = (this: { toolName?: unknown }) => unknown;
+
+interface GenericRendererPatchState {
+	version: number;
+	originalShell: ShellMethod;
+	originalCall: RendererMethod;
+	originalResult: RendererMethod;
+	wrappedShell: ShellMethod;
+	wrappedCall: RendererMethod;
+	wrappedResult: RendererMethod;
+}
 
 function keepsOwnRenderer(name: string): boolean {
 	return NATIVE_RENDERER_TOOL_NAMES.has(name) || name === "todo";
 }
 
+function isGenericRendererPatchState(value: unknown): value is GenericRendererPatchState {
+	if (typeof value !== "object" || value === null) return false;
+	const state = value as Partial<GenericRendererPatchState>;
+	return (
+		typeof state.version === "number" &&
+		typeof state.originalShell === "function" &&
+		typeof state.originalCall === "function" &&
+		typeof state.originalResult === "function" &&
+		typeof state.wrappedShell === "function" &&
+		typeof state.wrappedCall === "function" &&
+		typeof state.wrappedResult === "function"
+	);
+}
+
 function patchUnknownToolRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as unknown as Record<PropertyKey, unknown>;
-	if (prototype[GENERIC_RENDERER_PATCH]) return;
-
-	const originalShell = prototype.getRenderShell;
-	if (typeof originalShell === "function") {
-		prototype.getRenderShell = function (this: { toolName?: unknown }) {
-			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (!NATIVE_RENDERER_TOOL_NAMES.has(name)) return "self";
-			return Reflect.apply(originalShell, this, []);
-		};
+	const previous = prototype[GENERIC_RENDERER_PATCH];
+	if (isGenericRendererPatchState(previous)) {
+		const wrappersAreCurrent =
+			prototype.getRenderShell === previous.wrappedShell &&
+			prototype.getCallRenderer === previous.wrappedCall &&
+			prototype.getResultRenderer === previous.wrappedResult;
+		if (!wrappersAreCurrent || previous.version === GENERIC_RENDERER_PATCH_VERSION) return;
+		prototype.getRenderShell = previous.originalShell;
+		prototype.getCallRenderer = previous.originalCall;
+		prototype.getResultRenderer = previous.originalResult;
+	} else if (previous !== undefined) {
+		// A legacy or foreign patch owns the prototype. A process restart will
+		// install this version without stacking wrappers during hot reload.
+		return;
 	}
 
-	const originalCall = prototype.getCallRenderer;
-	if (typeof originalCall === "function") {
-		prototype.getCallRenderer = function (this: { toolName?: unknown }) {
-			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (keepsOwnRenderer(name)) {
-				const renderer = Reflect.apply(originalCall, this, []) as
-					| ((...args: unknown[]) => Component)
-					| undefined;
-				if (name !== "todo" || !renderer) return renderer;
-				return (...args: unknown[]) => new ToolIndent(renderer(...args));
-			}
-			return (args: unknown, theme: Theme, context: RenderContext) =>
-				renderCallLine(genericLabel(name), genericSummary(args), theme, context);
-		};
-	}
+	const originalShellValue = prototype.getRenderShell;
+	const originalCallValue = prototype.getCallRenderer;
+	const originalResultValue = prototype.getResultRenderer;
+	if (
+		typeof originalShellValue !== "function" ||
+		typeof originalCallValue !== "function" ||
+		typeof originalResultValue !== "function"
+	) return;
 
-	const originalResult = prototype.getResultRenderer;
-	if (typeof originalResult === "function") {
-		prototype.getResultRenderer = function (this: { toolName?: unknown }) {
-			const name = typeof this.toolName === "string" ? this.toolName : "tool";
-			if (keepsOwnRenderer(name)) {
-				const renderer = Reflect.apply(originalResult, this, []) as
-					| ((...args: unknown[]) => Component)
-					| undefined;
-				if (name !== "todo" || !renderer) return renderer;
-				return (...args: unknown[]) => new ToolIndent(renderer(...args));
-			}
-			return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
-				renderGenericResult(result, options, theme, context);
-		};
-	}
+	const originalShell = originalShellValue as ShellMethod;
+	const originalCall = originalCallValue as RendererMethod;
+	const originalResult = originalResultValue as RendererMethod;
 
-	Object.defineProperty(prototype, GENERIC_RENDERER_PATCH, { value: true });
+	const wrappedShell: ShellMethod = function (this: { toolName?: unknown }) {
+		const name = typeof this.toolName === "string" ? this.toolName : "tool";
+		if (name === "todo") return "self";
+		if (NATIVE_RENDERER_TOOL_NAMES.has(name)) return Reflect.apply(originalShell, this, []);
+
+		const callRenderer = Reflect.apply(originalCall, this, []) as ToolRenderer | undefined;
+		const resultRenderer = Reflect.apply(originalResult, this, []) as ToolRenderer | undefined;
+		if (callRenderer || resultRenderer) return Reflect.apply(originalShell, this, []);
+		return "self";
+	};
+
+	const wrappedCall: RendererMethod = function (this: { toolName?: unknown }) {
+		const name = typeof this.toolName === "string" ? this.toolName : "tool";
+		const renderer = Reflect.apply(originalCall, this, []) as ToolRenderer | undefined;
+		if (renderer) {
+			if (name !== "todo") return renderer;
+			return (...args: never[]) => new ToolIndent(renderer(...args));
+		}
+		if (keepsOwnRenderer(name)) return undefined;
+		return (args: unknown, theme: Theme, context: RenderContext) =>
+			renderCallLine(genericLabel(name), genericSummary(args), theme, context);
+	};
+
+	const wrappedResult: RendererMethod = function (this: { toolName?: unknown }) {
+		const name = typeof this.toolName === "string" ? this.toolName : "tool";
+		const renderer = Reflect.apply(originalResult, this, []) as ToolRenderer | undefined;
+		if (renderer) {
+			if (name !== "todo") return renderer;
+			return (...args: never[]) => new ToolIndent(renderer(...args));
+		}
+		if (keepsOwnRenderer(name)) return undefined;
+		return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
+			renderGenericResult(result, options, theme, context);
+	};
+
+	prototype.getRenderShell = wrappedShell;
+	prototype.getCallRenderer = wrappedCall;
+	prototype.getResultRenderer = wrappedResult;
+	Object.defineProperty(prototype, GENERIC_RENDERER_PATCH, {
+		configurable: true,
+		writable: true,
+		value: {
+			version: GENERIC_RENDERER_PATCH_VERSION,
+			originalShell,
+			originalCall,
+			originalResult,
+			wrappedShell,
+			wrappedCall,
+			wrappedResult,
+		} satisfies GenericRendererPatchState,
+	});
 }
 
 function registerBuiltInTools(pi: ExtensionAPI): void {

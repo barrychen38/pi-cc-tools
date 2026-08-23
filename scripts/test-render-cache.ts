@@ -169,6 +169,90 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
 }
 
+// Registered custom renderers take precedence over the generic fallback.
+// pi-mcp-adapter relies on this path for its dedicated call/result UI.
+{
+	let callRendered = false;
+	let resultRendered = false;
+	const custom: ToolDefinition = {
+		name: "mcp",
+		label: "MCP",
+		description: "test",
+		parameters: {},
+		renderShell: "self",
+		renderCall() {
+			callRendered = true;
+			return new Text("Native MCP call", 0, 0);
+		},
+		renderResult() {
+			resultRendered = true;
+			return new Text("Native MCP result", 0, 0);
+		},
+	};
+	const component = toolComponent("mcp", { action: "status" }, {
+		content: [{ type: "text", text: "generic result must not render" }],
+	}, custom);
+	const rendered = plain(component.render(width));
+
+	assert((component as unknown as { getRenderShell(): string }).getRenderShell() === "self", "MCP shell was overridden");
+	assert(callRendered && resultRendered, "MCP native renderers were not used");
+	assert(rendered.includes("Native MCP call"), `MCP native call missing: ${rendered}`);
+	assert(rendered.includes("Native MCP result"), `MCP native result missing: ${rendered}`);
+	assert(!rendered.includes("generic result must not render"), "MCP result fell back to generic output");
+	console.log("OK  MCP renderer: registered call/result/shell stay unchanged");
+}
+
+// If a custom tool only supplies one renderer, preserve it and fill the
+// missing half with the compact generic renderer in the tool's own shell.
+{
+	const callOnly: ToolDefinition = {
+		name: "call_only",
+		label: "call only",
+		description: "test",
+		parameters: {},
+		renderCall() {
+			return new Text("Native call only", 0, 0);
+		},
+	};
+	const callComponent = toolComponent("call_only", { query: "needle" }, {
+		content: [{ type: "text", text: "generic result" }],
+	}, callOnly);
+	const callRendered = plain(callComponent.render(width));
+	assert((callComponent as unknown as { getRenderShell(): string }).getRenderShell() === "default", "partial renderer shell changed");
+	assert(callRendered.includes("Native call only"), `partial native call missing: ${callRendered}`);
+	assert(callRendered.includes("generic result"), `partial generic result missing: ${callRendered}`);
+
+	const resultOnly: ToolDefinition = {
+		name: "result_only",
+		label: "result only",
+		description: "test",
+		parameters: {},
+		renderResult() {
+			return new Text("Native result only", 0, 0);
+		},
+	};
+	const resultComponent = toolComponent("result_only", { query: "needle" }, {
+		content: [{ type: "text", text: "ignored generic result" }],
+	}, resultOnly);
+	const resultRendered = plain(resultComponent.render(width));
+	assert(resultRendered.includes("needle"), `partial generic call missing: ${resultRendered}`);
+	assert(resultRendered.includes("Native result only"), `partial native result missing: ${resultRendered}`);
+	assert(!resultRendered.includes("ignored generic result"), "partial native result was replaced");
+	console.log("OK  partial renderer: registered half wins and missing half uses fallback");
+}
+
+// Re-registering the extension (the /reload path) must reuse the installed
+// prototype wrappers instead of stacking another generic-renderer layer.
+{
+	const prototype = ToolExecutionComponent.prototype as unknown as Record<string, unknown>;
+	const methods = [prototype.getRenderShell, prototype.getCallRenderer, prototype.getResultRenderer];
+	extension.default(new FakePi() as never);
+	assert(prototype.getRenderShell === methods[0], "reload replaced the shell wrapper");
+	assert(prototype.getCallRenderer === methods[1], "reload replaced the call wrapper");
+	assert(prototype.getResultRenderer === methods[2], "reload replaced the result wrapper");
+	console.log("OK  renderer reload: prototype wrappers remain single-layered");
+}
+
 // Agent/subagent tools keep their own registered renderers instead of the
 // compact MCP/custom fallback, so pi-subagents controls its native output style.
 {
