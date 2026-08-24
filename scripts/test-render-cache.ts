@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import { Container, Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import {
+	CombinedAutocompleteProvider,
+	Container,
+	Text,
+	visibleWidth,
+	type AutocompleteProvider,
+	type Component,
+} from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
@@ -388,8 +395,12 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const workingMessages: Array<string | undefined> = [];
 	const visibility: boolean[] = [];
 	const thinkingLabels: Array<string | undefined> = [];
+	const autocompleteProviders: Array<(current: AutocompleteProvider) => AutocompleteProvider> = [];
 	const ui = {
 		theme,
+		addAutocompleteProvider(factory: (current: AutocompleteProvider) => AutocompleteProvider) {
+			autocompleteProviders.push(factory);
+		},
 		setWorkingIndicator(value?: { frames?: string[] }) { workingIndicators.push(value); },
 		setWorkingMessage(value?: string) { workingMessages.push(value); },
 		setWorkingVisible(value: boolean) { visibility.push(value); },
@@ -399,6 +410,48 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	for (const name of ["session_start", "before_agent_start", "agent_start", "turn_start"]) {
 		for (const handler of fakePi.events.get(name) ?? []) await handler({ type: name }, context);
 	}
+
+	// The session lifecycle must register `$` through Pi's wrapper API so its
+	// trigger survives pi-subagents' `@` wrapper in either load order.
+	assert(autocompleteProviders.length === 1, "session_start did not register the skill autocomplete provider");
+	const createSkillProvider = autocompleteProviders[0]!;
+	const createMentionProvider = (current: AutocompleteProvider): AutocompleteProvider => ({
+		triggerCharacters: ["@"],
+		getSuggestions: (...args) => current.getSuggestions(...args),
+		applyCompletion: (...args) => current.applyCompletion(...args),
+		shouldTriggerFileCompletion: (...args) => current.shouldTriggerFileCompletion?.(...args) ?? true,
+	});
+	for (const wrappers of [
+		[createMentionProvider, createSkillProvider],
+		[createSkillProvider, createMentionProvider],
+	]) {
+		let fileCompletionDelegated = false;
+		let provider: AutocompleteProvider = new CombinedAutocompleteProvider([
+			{ name: "skill:code-review", description: "Review code" },
+		], cwd);
+		provider.shouldTriggerFileCompletion = () => {
+			fileCompletionDelegated = true;
+			return false;
+		};
+		const triggerCharacters: string[] = [];
+		for (const wrap of wrappers) {
+			provider = wrap(provider);
+			triggerCharacters.push(...(provider.triggerCharacters ?? []));
+		}
+		provider.triggerCharacters = [...new Set(triggerCharacters)];
+
+		assert(provider.triggerCharacters.includes("@"), "agent mention trigger was dropped");
+		assert(provider.triggerCharacters.includes("$"), "skill trigger was dropped");
+		const suggestions = await provider.getSuggestions(["$"], 0, 1, { signal: new AbortController().signal });
+		const skill = suggestions?.items.find((item) => item.value === "code-review");
+		assert(skill, "skill suggestions were not returned");
+		const completion = provider.applyCompletion(["$"], 0, 1, skill, "$");
+		assert(completion.lines[0] === "$code-review ", "skill completion was not delegated");
+		assert(provider.shouldTriggerFileCompletion?.(["plain"], 0, 5) === false, "file completion result changed");
+		assert(fileCompletionDelegated, "file completion was not delegated");
+	}
+	console.log("OK  skill autocomplete: lifecycle registration survives other provider wrappers");
+
 	assert(workingIndicators.length > 0 && workingIndicators.at(-1) === undefined, "default working indicator was not restored");
 	assert(workingMessages.length > 0 && workingMessages.at(-1) === undefined, "default working message was not restored");
 	assert(visibility.at(-1) === true, "working indicator row was not enabled");

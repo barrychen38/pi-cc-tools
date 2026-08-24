@@ -22,6 +22,7 @@ import {
 	Spacer,
 	Text,
 	type AutocompleteItem,
+	type AutocompleteProvider,
 	type AutocompleteSuggestions,
 	type Component,
 } from "@earendil-works/pi-tui";
@@ -86,7 +87,6 @@ const skillNamesForDisplay = new Set<string>();
 
 type SkillAutocompleteProvider = {
 	commands?: readonly (AutocompleteItem | { name: string; description?: string })[];
-	triggerCharacters?: string[];
 };
 
 type EditorPatch = {
@@ -186,12 +186,25 @@ function appendReferencedSkillsToSystemPrompt(
 	return `${systemPrompt}\n\n<referenced_skills>\nThe user referenced these skills with $name tokens in their prompt. Apply the matching skill instructions while preserving the user's original wording as the task request.\n\n${blocks.join("\n\n")}\n</referenced_skills>`;
 }
 
+function createSkillTriggerProvider(current: AutocompleteProvider): AutocompleteProvider {
+	return {
+		triggerCharacters: [SKILL_TRIGGER],
+		getSuggestions(lines, cursorLine, cursorCol, options) {
+			return current.getSuggestions(lines, cursorLine, cursorCol, options);
+		},
+		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+		},
+		shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+			return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+		},
+	};
+}
+
 function patchSkillAutocomplete(): void {
 	const editorPrototype = Editor.prototype as unknown as Record<PropertyKey, unknown>;
 	const providerPrototype = CombinedAutocompleteProvider.prototype as unknown as Record<PropertyKey, unknown>;
 	if (editorPrototype[SKILL_AUTOCOMPLETE_PATCH]) return;
-
-	(providerPrototype as SkillAutocompleteProvider).triggerCharacters = [SKILL_TRIGGER];
 
 	editorPrototype.isSlashMenuAllowed = function restoredIsSlashMenuAllowed(this: EditorPatch) {
 		return this.state?.cursorLine === 0;
@@ -1340,6 +1353,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		resetSettingsCache();
 		thinkingStates.clear();
+		ctx.ui.addAutocompleteProvider(createSkillTriggerProvider);
 		configureMinimalUi(ctx);
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
