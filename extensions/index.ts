@@ -48,16 +48,11 @@ type SettingsFile = {
 
 const EMPTY_TEXT = "";
 const DEFAULT_EXPANDED_LINES = 2_000;
-const TOOL_PADDING_X = 2;
 const THINKING_TEXT_TRUECOLOR = "\x1b[38;2;165;173;203m";
 const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
 const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer");
 const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
-const TODO_WIDGET_PATCH = Symbol.for("pi-cc-tools:todo-widget-indent");
-const SUBAGENT_WIDGET_PATCH = Symbol.for("pi-cc-tools:subagent-widget-indent");
-const TODO_WIDGET_KEYS = new Set(["rpiv-todos"]);
-const SUBAGENT_WIDGET_KEYS = new Set(["agents", "fleet"]);
 const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
@@ -78,6 +73,7 @@ function formatThinkDuration(ms: number): string {
 }
 
 const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
+const ASSISTANT_CONTENT_PADDING_PATCH = Symbol.for("pi-cc-tools:assistant-content-padding");
 const SKILL_AUTOCOMPLETE_PATCH = Symbol.for("pi-cc-tools:skill-autocomplete");
 const SKILL_TRIGGER = "$";
 const SKILL_COMMAND_PREFIX = "skill:";
@@ -311,6 +307,28 @@ function patchAssistantThinkingLabel(): void {
 	proto[THINKING_PATCH] = true;
 }
 
+function patchAssistantContentPadding(): void {
+	const proto = AssistantMessageComponent.prototype as unknown as Record<PropertyKey, unknown>;
+	if (proto[ASSISTANT_CONTENT_PADDING_PATCH]) return;
+
+	const original = proto.updateContent as (message: Record<string, unknown>) => void | undefined;
+	if (typeof original !== "function") return;
+
+	proto.updateContent = function patchedAssistantContentPadding(this: {
+		contentContainer?: { children?: Component[] };
+	}, message: Record<string, unknown>) {
+		const result = original.call(this, message);
+		for (const child of this.contentContainer?.children ?? []) {
+			const paddedChild = child as Component & { paddingX?: number };
+			if (typeof paddedChild.paddingX !== "number" || paddedChild.paddingX === 0) continue;
+			paddedChild.paddingX = 0;
+			paddedChild.invalidate();
+		}
+		return result;
+	};
+	proto[ASSISTANT_CONTENT_PADDING_PATCH] = true;
+}
+
 // ── caches ──
 const settingsCache = new Map<string, SettingsFile>();
 const toolCache = new Map<string, ReturnType<typeof createBuiltInTools>>();
@@ -420,7 +438,7 @@ function emptyText(): Text {
 }
 
 function toolText(value: string): Text {
-	return new Text(value, TOOL_PADDING_X, 0);
+	return new Text(value, 0, 0);
 }
 
 function patchFirstMessageSpacing(): void {
@@ -478,49 +496,6 @@ function patchEmptyWidgetSpacing(): void {
 		]);
 	};
 	prototype[EMPTY_WIDGET_SPACER_PATCH] = true;
-}
-
-class ToolIndent implements Component {
-	constructor(private readonly child: Component) {}
-
-	render(width: number): string[] {
-		const childWidth = Math.max(1, width - TOOL_PADDING_X);
-		const padding = " ".repeat(TOOL_PADDING_X);
-		return this.child.render(childWidth).map((line) => line ? `${padding}${line}` : line);
-	}
-
-	invalidate(): void {
-		this.child.invalidate();
-	}
-
-	dispose(): void {
-		(this.child as Component & { dispose?: () => void }).dispose?.();
-	}
-}
-
-function patchWidgetIndent(patch: symbol, widgetKeys: ReadonlySet<string>): void {
-	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
-	if (prototype[patch]) return;
-
-	const original = prototype.setExtensionWidget;
-	if (typeof original !== "function") return;
-
-	prototype.setExtensionWidget = function (
-		key: string,
-		content: string[] | ((...args: unknown[]) => Component) | undefined,
-		options?: unknown,
-	) {
-		let indentedContent = content;
-		if (widgetKeys.has(key) && Array.isArray(content)) {
-			// Pi wraps string widgets in Text with one column of host padding.
-			const padding = " ".repeat(Math.max(0, TOOL_PADDING_X - 1));
-			indentedContent = content.map((line) => line ? `${padding}${line}` : line);
-		} else if (widgetKeys.has(key) && typeof content === "function") {
-			indentedContent = (...args: unknown[]) => new ToolIndent(Reflect.apply(content, undefined, args));
-		}
-		return Reflect.apply(original, this, [key, indentedContent, options]);
-	};
-	prototype[patch] = true;
 }
 
 function oneLine(value: unknown, max = 72): string {
@@ -1079,7 +1054,7 @@ function renderGenericResult(
 
 const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
 const NATIVE_RENDERER_TOOL_NAMES = new Set([...BUILT_IN_TOOL_NAMES, "Agent"]);
-const GENERIC_RENDERER_PATCH_VERSION = 2;
+const GENERIC_RENDERER_PATCH_VERSION = 3;
 
 type ToolRenderer = (...args: never[]) => Component;
 type RendererMethod = (this: { toolName?: unknown }) => ToolRenderer | undefined;
@@ -1158,11 +1133,7 @@ function patchUnknownToolRendering(): void {
 	const wrappedCall: RendererMethod = function (this: { toolName?: unknown }) {
 		const name = typeof this.toolName === "string" ? this.toolName : "tool";
 		const renderer = Reflect.apply(originalCall, this, []) as ToolRenderer | undefined;
-		if (renderer) {
-			const usesSelfShell = Reflect.apply(originalShell, this, []) === "self";
-			if (name !== "todo" && (!usesSelfShell || NATIVE_RENDERER_TOOL_NAMES.has(name))) return renderer;
-			return (...args: never[]) => new ToolIndent(renderer(...args));
-		}
+		if (renderer) return renderer;
 		if (keepsOwnRenderer(name)) return undefined;
 		return (args: unknown, theme: Theme, context: RenderContext) =>
 			renderCallLine(genericLabel(name), genericSummary(args), theme, context);
@@ -1171,11 +1142,7 @@ function patchUnknownToolRendering(): void {
 	const wrappedResult: RendererMethod = function (this: { toolName?: unknown }) {
 		const name = typeof this.toolName === "string" ? this.toolName : "tool";
 		const renderer = Reflect.apply(originalResult, this, []) as ToolRenderer | undefined;
-		if (renderer) {
-			const usesSelfShell = Reflect.apply(originalShell, this, []) === "self";
-			if (name !== "todo" && (!usesSelfShell || NATIVE_RENDERER_TOOL_NAMES.has(name))) return renderer;
-			return (...args: never[]) => new ToolIndent(renderer(...args));
-		}
+		if (renderer) return renderer;
 		if (keepsOwnRenderer(name)) return undefined;
 		return (result: TextResult, options: { expanded: boolean }, theme: Theme, context: RenderContext) =>
 			renderGenericResult(result, options, theme, context);
@@ -1365,10 +1332,9 @@ export default function (pi: ExtensionAPI): void {
 	patchSkillAutocomplete();
 	patchFirstMessageSpacing();
 	patchEmptyWidgetSpacing();
-	patchWidgetIndent(TODO_WIDGET_PATCH, TODO_WIDGET_KEYS);
-	patchWidgetIndent(SUBAGENT_WIDGET_PATCH, SUBAGENT_WIDGET_KEYS);
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
+	patchAssistantContentPadding();
 	registerBuiltInTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {

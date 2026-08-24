@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import { Container, Text, type Component } from "@earendil-works/pi-tui";
+import { Container, Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 initTheme("dark", false);
@@ -74,6 +74,16 @@ function ensureArray(output: string[] | string): string[] {
 
 function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
+}
+
+function assertTextStartsAtColumnZero(lines: string[], text: string): void {
+	const line = lines.find((candidate) => candidate.includes(text));
+	assert(line, `rendered text was missing: ${text}`);
+	const textIndex = line.indexOf(text);
+	assert(
+		visibleWidth(line.slice(0, textIndex)) === 0,
+		`rendered text had left padding: ${text}`,
+	);
 }
 
 function toolComponent(
@@ -170,7 +180,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 }
 
 // Registered custom renderers take precedence over the generic fallback.
-// Self-rendered MCP output keeps its dedicated UI but receives the shared indent.
+// Self-rendered MCP output keeps its dedicated UI without extension-added padding.
 {
 	let callRendered = false;
 	let resultRendered = false;
@@ -201,10 +211,10 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(!rendered.includes("generic result must not render"), "MCP result fell back to generic output");
 	const visible = ensureArray(component.render(width)).map(stripAnsi).filter((line) => line.trim().length > 0);
 	assert(
-		visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")),
-		`MCP output did not use two-column indent: ${JSON.stringify(visible)}`,
+		visible.every((line) => line === line.trimStart()),
+		`MCP output received extension-added padding: ${JSON.stringify(visible)}`,
 	);
-	console.log("OK  MCP renderer: native call/result use the shared two-column indent");
+	console.log("OK  MCP renderer: native call/result keep full width");
 }
 
 // If a custom tool only supplies one renderer, preserve it and fill the
@@ -298,7 +308,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  Agent renderer: native subagent output stays unchanged");
 }
 
-// Ordinary assistant content remains on Pi's native renderer.
+// Ordinary assistant content stays on Pi's native renderer without horizontal padding.
 {
 	const message = {
 		role: "assistant",
@@ -307,9 +317,18 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	};
 	const component = new AssistantMessageComponent(message as never, false);
 	const children = (component as unknown as { contentContainer?: { children?: unknown[] } }).contentContainer?.children ?? [];
-	assert(!children.some((child) => (child as { constructor?: { name?: string } }).constructor?.name === "DottedParagraph"), "assistant renderer was globally patched");
+	assert(!children.some((child) => (child as { constructor?: { name?: string } }).constructor?.name === "DottedParagraph"), "assistant renderer was globally replaced");
 	assert(message.content[0].text === "hello", "assistant message was mutated");
-	console.log("OK  native messages: ordinary assistant rendering remains unchanged");
+	assertTextStartsAtColumnZero(ensureArray(component.render(width)), "hello");
+
+	const error = new AssistantMessageComponent({
+		role: "assistant",
+		content: [],
+		stopReason: "error",
+		errorMessage: "failure",
+	} as never, false);
+	assertTextStartsAtColumnZero(ensureArray(error.render(width)), "Error: failure");
+	console.log("OK  native messages: assistant text and errors use full width");
 }
 
 // A quiet new session keeps one row above its first user message.
@@ -446,9 +465,9 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		assert(errCallLine, `${name} error call line was missing`);
 		const errorCallIndent = callIndent(errCallLine);
 
-		assert(renderedCallIndent === 2, `${name} call indent was ${renderedCallIndent}, expected 2`);
-		assert(renderedResultIndent === 2, `${name} result indent was ${renderedResultIndent}, expected 2`);
-		assert(errorCallIndent === 2, `${name} error call indent was ${errorCallIndent}, expected 2`);
+		assert(renderedCallIndent === 0, `${name} call indent was ${renderedCallIndent}, expected 0`);
+		assert(renderedResultIndent === 0, `${name} result indent was ${renderedResultIndent}, expected 0`);
+		assert(errorCallIndent === 0, `${name} error call indent was ${errorCallIndent}, expected 0`);
 		console.log(`  ${name.padEnd(6)} call@${renderedCallIndent} branch@${renderedResultIndent ?? "?"} errCall@${errorCallIndent}`);
 	}
 
@@ -476,8 +495,8 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const pendingIndent = pendingLine.match(/^(\s*)/)?.[1].length ?? 0;
 	const completedIndent = completedLine.match(/^(\s*)/)?.[1].length ?? 0;
 	assert(pendingIndent === completedIndent, `pending indent ${pendingIndent} != completed indent ${completedIndent}`);
-	assert(pendingIndent === 2, `pending indent was ${pendingIndent}, expected 2`);
-	console.log("OK  alignment: pending ○ and completed ● share same left indent");
+	assert(pendingIndent === 0, `pending indent was ${pendingIndent}, expected 0`);
+	console.log("OK  alignment: pending ○ and completed ● use full width");
 }
 
 // ── Custom/todo tools use the same unboxed, left-aligned shell ──
@@ -503,11 +522,11 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	}, todoDefinition);
 	const visible = ensureArray(component.render(width)).map(stripAnsi).filter((line) => line.trim().length > 0);
 	assert(visible.some((line) => line.includes("todo create sample")), "todo kept the default colored shell");
-	assert(visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")), `todo output did not use two-column indent: ${JSON.stringify(visible)}`);
-	console.log("OK  alignment: todo/custom shell is unboxed and starts at column 2");
+	assert(visible.every((line) => line === line.trimStart()), `todo output received extension-added padding: ${JSON.stringify(visible)}`);
+	console.log("OK  alignment: todo/custom shell is unboxed and uses full width");
 }
 
-// ── Todo and subagent widgets receive the same two-column indent ──
+// ── Todo and subagent widgets receive the full terminal width ──
 {
 	const extensionWidgetsAbove = new Map<string, Component>();
 	const extensionWidgetsBelow = new Map<string, Component>();
@@ -542,11 +561,34 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		assert(widget, `${testCase.key} widget was not registered`);
 		const visible = widget.render(width).map(stripAnsi).filter((line) => line.trim().length > 0);
 		assert(
-			visible.every((line) => line.startsWith("  ") && !line.startsWith("   ")),
-			`${testCase.key} widget did not use two-column indent: ${JSON.stringify(visible)}`,
+			visible.every((line) => line === line.trimStart()),
+			`${testCase.key} widget received extension-added padding: ${JSON.stringify(visible)}`,
 		);
 	}
-	console.log("OK  alignment: todo and subagent widgets start at column 2");
+
+	const terminalWidth = 95;
+	let receivedWidth: number | undefined;
+	setExtensionWidget.call(
+		fakeInteractiveMode,
+		"agents",
+		() => ({
+			render: (renderWidth: number) => {
+				receivedWidth = renderWidth;
+				return [theme.fg("muted", "x".repeat(renderWidth))];
+			},
+			invalidate() {},
+		}),
+		{ placement: "aboveEditor" },
+	);
+	const agentWidget = extensionWidgetsAbove.get("agents");
+	assert(agentWidget, "agents width regression widget was not registered");
+	const agentLines = agentWidget.render(terminalWidth);
+	assert(receivedWidth === terminalWidth, `agent widget received width ${receivedWidth}, expected ${terminalWidth}`);
+	assert(
+		agentLines.every((line) => visibleWidth(line) === terminalWidth),
+		`agent widget did not use the full terminal width: ${agentLines.map(visibleWidth).join(", ")}`,
+	);
+	console.log("OK  alignment: todo and subagent widgets use full terminal width");
 }
 
 // ── Write/edit summaries count replacements and show changed lines ──
@@ -654,7 +696,9 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		_piCcToolsThinkDurationMs: 1_234,
 	};
 	const historical = new AssistantMessageComponent(historicalMessage as never, true);
-	assert(plain(ensureArray(historical.render(width))).includes("Thought for 1.2s"), "historical duration label was missing");
+	const historicalRender = ensureArray(historical.render(width));
+	assert(plain(historicalRender).includes("Thought for 1.2s"), "historical duration label was missing");
+	assertTextStartsAtColumnZero(historicalRender, "Thought for 1.2s");
 
 	const currentMessageBase = {
 		role: "assistant",
@@ -697,6 +741,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const activeOutput = plain(activeRender);
 	assert(activeOutput.includes("Thinking for "), "active thinking elapsed label was missing");
 	assert(!activeOutput.includes("thought-line-12"), "active thinking content was visible");
+	assertTextStartsAtColumnZero(activeRender, "Thinking for ");
 
 	historical.invalidate();
 	const unchangedHistory = plain(ensureArray(historical.render(width)));
@@ -729,6 +774,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const completedOutput = plain(completedRender);
 	assert(completedOutput.includes("Thought for "), "completed thinking duration label was missing");
 	assert(!completedOutput.includes("thought-line-12"), "completed thinking content did not collapse");
+	assertTextStartsAtColumnZero(completedRender, "Thought for ");
 
 	const finalMessage = {
 		...currentMessageBase,
@@ -739,10 +785,12 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	}
 	assert(typeof (finalMessage as { _piCcToolsThinkDurationMs?: unknown })._piCcToolsThinkDurationMs === "number", "thinking duration was not persisted to the final message");
 	const reloaded = new AssistantMessageComponent(finalMessage as never, true);
-	const reloadedOutput = plain(ensureArray(reloaded.render(width)));
+	const reloadedRender = ensureArray(reloaded.render(width));
+	const reloadedOutput = plain(reloadedRender);
 	assert(reloadedOutput.includes("Thought for "), "persisted thinking duration was not rendered");
 	assert(!reloadedOutput.includes("thought-line-12"), "persisted thinking content was not collapsed");
-	console.log("OK  thinking: elapsed label refreshes, content stays hidden, history stays unchanged");
+	assertTextStartsAtColumnZero(reloadedRender, "Thought for ");
+	console.log("OK  thinking: labels use full width, content stays hidden, history stays unchanged");
 }
 
 console.log("\nAll minimal-renderer checks passed.");
