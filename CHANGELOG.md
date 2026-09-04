@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Collapsed successful results now show the first 3 output lines in muted gray with a dim `… +N lines (ctrl+o to expand)` hint instead of a bare line count; applies to built-in and MCP/custom tools alike.
+
 - `Agent` / subagent tool rendering now passes through the tool's own registered shell, call renderer, and result renderer instead of applying a separate compact live-status renderer.
 - File-changing `write` and `edit` results now share the same output shape: `+N -N` summary plus a bounded diff preview so changed code is visible without expanding the tool.
 - Optional `diffRenderer: "delta" | "auto"` support uses a local `delta` executable for compact `write` / `edit` previews, omitting file headers, hunk headers, and delta line-number columns while explicitly passing Catppuccin Macchiato diff colors when configured.

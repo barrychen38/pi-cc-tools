@@ -49,6 +49,7 @@ type SettingsFile = {
 
 const EMPTY_TEXT = "";
 const DEFAULT_EXPANDED_LINES = 2_000;
+const COLLAPSED_PREVIEW_LINES = 3;
 const THINKING_TEXT_TRUECOLOR = "\x1b[38;2;165;173;203m";
 const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
@@ -612,6 +613,21 @@ function expandedText(result: TextResult, maxLines: number): string {
 	return output;
 }
 
+function collapsedPreview(result: TextResult, theme: Theme): Text | undefined {
+	const joined = textBlocks(result).join("\n");
+	if (!joined.trim()) return undefined;
+
+	const total = joined.replace(/\r/g, "").trim().split("\n").length;
+	const { text: head, truncated } = takeLines(joined, COLLAPSED_PREVIEW_LINES);
+	const lines = head.split("\n");
+	if (lines.at(-1) === "…") lines.pop();
+	if (truncated) {
+		const hidden = total - COLLAPSED_PREVIEW_LINES;
+		lines.push(theme.fg("dim", `… +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)`));
+	}
+	return toolText(branchBlock(lines.map((line) => theme.fg("muted", line)).join("\n"), theme));
+}
+
 function branchBlock(content: string, theme: Theme): string {
 	const rule = theme.fg("borderMuted", "└─");
 	const continuation = theme.fg("borderMuted", "│");
@@ -641,10 +657,7 @@ function renderMinimalResult(
 	}
 
 	if (!expanded) {
-		const total = textBlocks(result).reduce((sum, b) => sum + b.split("\n").length, 0);
-		if (total === 0) return emptyText();
-		const label = `${total} line${total === 1 ? "" : "s"}`;
-		return toolText(branchBlock(theme.fg("muted", label), theme));
+		return collapsedPreview(result, theme) ?? emptyText();
 	}
 
 	const raw = expandedText(result, maxLines);
@@ -1053,11 +1066,7 @@ function renderGenericResult(
 	}
 
 	if (!options.expanded) {
-		// Show the first line of output — more useful than line counts for
-		// todo, ask_user_question, and other MCP/custom tools.
-		const first = firstTextLine(result);
-		if (!first || first === "Tool failed") return emptyText();
-		return toolText(branchBlock(theme.fg("muted", oneLine(first, 120)), theme));
+		return collapsedPreview(result, theme) ?? emptyText();
 	}
 
 	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);

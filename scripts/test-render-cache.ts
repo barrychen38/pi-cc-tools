@@ -119,20 +119,24 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(fakePi.tools.has(name), `missing built-in override: ${name}`);
 }
 
-// Successful results are hidden in collapsed mode, while the existing compact
-// title/status style remains visible.
+// Successful results show a bounded 5-line head preview in collapsed mode;
+// Ctrl+O still expands the full result.
 {
 	const component = toolComponent("read", { path: "src/index.ts" }, {
-		content: [{ type: "text", text: "success payload\nsecond line" }],
+		content: [{ type: "text", text: "line one\nline two\nline three\nline four\nline five\nline six\nline seven" }],
 	});
 	const collapsed = plain(component.render(width));
 	assert(collapsed.includes("● Read src/index.ts"), "collapsed read call style changed");
-	assert(!collapsed.includes("success payload"), "successful collapsed output was not hidden");
+	assert(collapsed.includes("└─ line one"), "collapsed preview did not show head lines");
+	assert(collapsed.includes("line three"), "collapsed preview stopped before 3 lines");
+	assert(!collapsed.includes("line four"), "collapsed preview exceeded 3 lines");
+	assert(collapsed.includes("… +4 lines (ctrl+o to expand)"), "collapsed preview missing truncation hint");
 
 	component.setExpanded(true);
 	const expanded = plain(component.render(width));
-	assert(expanded.includes("└─ success payload"), "expanded result did not keep branch styling");
-	console.log("OK  built-in renderer: compact success + styled expanded result");
+	assert(expanded.includes("└─ line one"), "expanded result did not keep branch styling");
+	assert(expanded.includes("line seven"), "expanded result did not include tail lines");
+	console.log("OK  built-in renderer: collapsed 5-line preview + styled expanded result");
 }
 
 // Partial results never render live previews; the call remains a static
@@ -178,12 +182,14 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		parameters: {},
 	};
 	const component = toolComponent("mcp__demo__search", { query: "needle" }, {
-		content: [{ type: "text", text: "custom result" }],
+		content: [{ type: "text", text: "custom result\nsecond line\nthird line\nfourth line\nfifth line\nsixth line" }],
 	}, custom);
 	const collapsed = plain(component.render(width));
 	assert(collapsed.includes("● MCP needle"), "generic custom call renderer was not installed");
 	assert(collapsed.includes("└─ custom result"), "generic custom result did not show first-line summary");
-	console.log("OK  generic renderer: MCP/custom tools show first-line result summary");
+	assert(collapsed.includes("… +3 lines (ctrl+o to expand)"), "generic custom result missing truncation hint");
+	assert(!collapsed.includes("fourth line"), "generic custom result exceeded 3-line preview");
+	console.log("OK  generic renderer: MCP/custom tools show 3-line result preview");
 }
 
 // Registered custom renderers take precedence over the generic fallback.
