@@ -4,6 +4,8 @@
 
 ### Changed
 
+- `Agent` / subagent output now keeps its native status background in transparent/outline modes while all other tool shells remain transparent.
+- Restored Pi's native one-line gap between transcript output and the input editor.
 - Collapsed successful results now show the first 3 non-empty, width-bounded output lines in muted gray with a dim `… +N lines (ctrl+o to expand)` hint instead of a bare line count; applies to built-in and MCP/custom tools alike.
 - Running `bash` tools now show a live 3-line non-empty tail preview with elapsed time, while completed rows retain a dim duration.
 - MCP/custom partial updates now show their first progress line instead of leaving the tool row blank.

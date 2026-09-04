@@ -64,8 +64,6 @@ const THINKING_TEXT_TRUECOLOR = "\x1b[38;2;165;173;203m";
 const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
 const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer");
-const EMPTY_WIDGET_SPACER_PATCH = Symbol.for("pi-cc-tools:empty-widget-spacer");
-const TOOL_BACKGROUND_KEYS = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"] as const;
 
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
 type ThinkingState = { active: boolean; startedAt: number; duration?: number };
@@ -411,17 +409,6 @@ function readSettings(cwd: string): SettingsFile {
 	return merged;
 }
 
-function setThemeBackground(theme: Theme, key: string, value: string): void {
-	const themeValue = theme as unknown as {
-		bgColors?: Map<string, string> | Record<string, string>;
-	};
-	if (themeValue.bgColors instanceof Map) {
-		themeValue.bgColors.set(key, value);
-	} else if (themeValue.bgColors && typeof themeValue.bgColors === "object") {
-		themeValue.bgColors[key] = value;
-	}
-}
-
 function applyThinkingTextColor(theme: Theme): void {
 	const themeValue = theme as unknown as {
 		fgColors?: Map<string, string> | Record<string, string>;
@@ -436,22 +423,14 @@ function applyThinkingTextColor(theme: Theme): void {
 	}
 }
 
-function applyToolBackground(theme: Theme, cwd: string): void {
-	const mode = readSettings(cwd).toolBackground;
-	if (!mode || mode === "default") return;
-
-	// Keep transparent/outlines styles free of full-width native backgrounds.
-	// The compact renderer intentionally does not add horizontal rules; this
-	// leaves the existing color and theme choices without the old render patch.
-	for (const key of TOOL_BACKGROUND_KEYS) {
-		setThemeBackground(theme, key, "\x1b[49m");
-	}
+function usesTransparentToolShell(cwd: unknown): boolean {
+	const mode = readSettings(typeof cwd === "string" ? cwd : process.cwd()).toolBackground;
+	return mode !== undefined && mode !== "default";
 }
 
 function configureMinimalUi(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 	applyThinkingTextColor(ctx.ui.theme);
-	applyToolBackground(ctx.ui.theme, ctx.cwd);
 	ctx.ui.setWorkingIndicator();
 	ctx.ui.setWorkingMessage();
 	ctx.ui.setWorkingVisible(true);
@@ -497,29 +476,6 @@ function patchFirstMessageSpacing(): void {
 		return result;
 	};
 	prototype[FIRST_MESSAGE_SPACER_PATCH] = true;
-}
-
-function patchEmptyWidgetSpacing(): void {
-	const prototype = InteractiveMode.prototype as unknown as Record<PropertyKey, unknown>;
-	if (prototype[EMPTY_WIDGET_SPACER_PATCH]) return;
-
-	const original = prototype.renderWidgetContainer;
-	if (typeof original !== "function") return;
-
-	prototype.renderWidgetContainer = function (
-		container: unknown,
-		widgets: Map<string, Component>,
-		spacerWhenEmpty: boolean,
-		leadingSpacer: boolean,
-	) {
-		return Reflect.apply(original, this, [
-			container,
-			widgets,
-			spacerWhenEmpty && widgets.size > 0,
-			leadingSpacer,
-		]);
-	};
-	prototype[EMPTY_WIDGET_SPACER_PATCH] = true;
 }
 
 function oneLine(value: unknown, max = 72): string {
@@ -1182,11 +1138,11 @@ function renderGenericResult(
 
 const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "write", "edit", "find", "grep", "ls"]);
 const NATIVE_RENDERER_TOOL_NAMES = new Set([...BUILT_IN_TOOL_NAMES, "Agent"]);
-const GENERIC_RENDERER_PATCH_VERSION = 3;
+const GENERIC_RENDERER_PATCH_VERSION = 4;
 
 type ToolRenderer = (...args: never[]) => Component;
 type RendererMethod = (this: { toolName?: unknown }) => ToolRenderer | undefined;
-type ShellMethod = (this: { toolName?: unknown }) => unknown;
+type ShellMethod = (this: { toolName?: unknown; cwd?: unknown }) => unknown;
 
 interface GenericRendererPatchState {
 	version: number;
@@ -1247,9 +1203,10 @@ function patchUnknownToolRendering(): void {
 	const originalCall = originalCallValue as RendererMethod;
 	const originalResult = originalResultValue as RendererMethod;
 
-	const wrappedShell: ShellMethod = function (this: { toolName?: unknown }) {
+	const wrappedShell: ShellMethod = function (this: { toolName?: unknown; cwd?: unknown }) {
 		const name = typeof this.toolName === "string" ? this.toolName : "tool";
-		if (name === "todo") return "self";
+		if (name === "Agent") return Reflect.apply(originalShell, this, []);
+		if (name === "todo" || usesTransparentToolShell(this.cwd)) return "self";
 		if (NATIVE_RENDERER_TOOL_NAMES.has(name)) return Reflect.apply(originalShell, this, []);
 
 		const callRenderer = Reflect.apply(originalCall, this, []) as ToolRenderer | undefined;
@@ -1467,7 +1424,6 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 export default function (pi: ExtensionAPI): void {
 	patchSkillAutocomplete();
 	patchFirstMessageSpacing();
-	patchEmptyWidgetSpacing();
 	patchUnknownToolRendering();
 	patchAssistantThinkingLabel();
 	patchAssistantContentPadding();

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -98,6 +98,7 @@ function toolComponent(
 	args: Record<string, unknown>,
 	result: Record<string, unknown>,
 	definition: ToolDefinition | undefined = fakePi.tools.get(name),
+	componentCwd = cwd,
 ): ToolExecutionComponent {
 	const component = new ToolExecutionComponent(
 		name,
@@ -106,7 +107,7 @@ function toolComponent(
 		{ showImages: false },
 		definition as never,
 		fakeUi as never,
-		cwd,
+		componentCwd,
 	);
 	component.markExecutionStarted();
 	component.setArgsComplete();
@@ -260,8 +261,11 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 }
 
 // If a custom tool only supplies one renderer, preserve it and fill the
-// missing half with the compact generic renderer in the tool's own shell.
+// missing half with the compact generic renderer in a transparent shell.
 {
+	const transparentCwd = mkdtempSync(join(tmpdir(), "pi-cc-tools-partial-renderer-"));
+	mkdirSync(join(transparentCwd, ".pi"));
+	writeFileSync(join(transparentCwd, ".pi", "settings.json"), JSON.stringify({ toolBackground: "transparent" }));
 	const callOnly: ToolDefinition = {
 		name: "call_only",
 		label: "call only",
@@ -273,9 +277,9 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	};
 	const callComponent = toolComponent("call_only", { query: "needle" }, {
 		content: [{ type: "text", text: "generic result" }],
-	}, callOnly);
+	}, callOnly, transparentCwd);
 	const callRendered = plain(callComponent.render(width));
-	assert((callComponent as unknown as { getRenderShell(): string }).getRenderShell() === "default", "partial renderer shell changed");
+	assert((callComponent as unknown as { getRenderShell(): string }).getRenderShell() === "self", "partial renderer shell was not transparent");
 	assert(callRendered.includes("Native call only"), `partial native call missing: ${callRendered}`);
 	assert(callRendered.includes("generic result"), `partial generic result missing: ${callRendered}`);
 
@@ -290,11 +294,12 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	};
 	const resultComponent = toolComponent("result_only", { query: "needle" }, {
 		content: [{ type: "text", text: "ignored generic result" }],
-	}, resultOnly);
+	}, resultOnly, transparentCwd);
 	const resultRendered = plain(resultComponent.render(width));
 	assert(resultRendered.includes("needle"), `partial generic call missing: ${resultRendered}`);
 	assert(resultRendered.includes("Native result only"), `partial native result missing: ${resultRendered}`);
 	assert(!resultRendered.includes("ignored generic result"), "partial native result was replaced");
+	rmSync(transparentCwd, { recursive: true, force: true });
 	console.log("OK  partial renderer: registered half wins and missing half uses fallback");
 }
 
@@ -310,44 +315,76 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  renderer reload: prototype wrappers remain single-layered");
 }
 
-// Agent/subagent tools keep their own registered renderers instead of the
-// compact MCP/custom fallback, so pi-subagents controls its native output style.
+// In transparent modes, Agent/subagent tools keep their registered renderer
+// and native background while every other default-shell tool becomes unboxed.
 {
-	let callRendered = false;
-	let resultRendered = false;
-	const agentDefinition: ToolDefinition = {
-		name: "Agent",
-		label: "Agent",
-		description: "test",
-		parameters: {},
-		renderCall() {
-			callRendered = true;
-			return new Text("Native Agent call", 0, 0);
-		},
-		renderResult() {
-			resultRendered = true;
-			return new Text("Native Agent result", 0, 0);
-		},
-	};
-	const agent = new ToolExecutionComponent(
-		"Agent",
-		"test-Agent",
-		{ subagent_type: "Explore", description: "scan API", prompt: "Inspect the API" },
-		{ showImages: false },
-		agentDefinition as never,
-		fakeUi as never,
-		cwd,
-	);
-	agent.markExecutionStarted();
-	agent.updateResult({ content: [{ type: "text", text: "full agent result" }] } as never, false);
-	const rendered = plain(ensureArray(agent.render(width)));
+	const transparentCwd = mkdtempSync(join(tmpdir(), "pi-cc-tools-background-"));
+	mkdirSync(join(transparentCwd, ".pi"));
+	writeFileSync(join(transparentCwd, ".pi", "settings.json"), JSON.stringify({ toolBackground: "transparent" }));
+	try {
+		let callRendered = false;
+		let resultRendered = false;
+		const agentDefinition: ToolDefinition = {
+			name: "Agent",
+			label: "Agent",
+			description: "test",
+			parameters: {},
+			renderCall() {
+				callRendered = true;
+				return new Text("Native Agent call", 0, 0);
+			},
+			renderResult() {
+				resultRendered = true;
+				return new Text("Native Agent result", 0, 0);
+			},
+		};
+		const agent = new ToolExecutionComponent(
+			"Agent",
+			"test-Agent",
+			{ subagent_type: "Explore", description: "scan API", prompt: "Inspect the API" },
+			{ showImages: false },
+			agentDefinition as never,
+			fakeUi as never,
+			transparentCwd,
+		);
+		agent.markExecutionStarted();
+		agent.updateResult({ content: [{ type: "text", text: "full agent result" }] } as never, false);
+		const agentLines = ensureArray(agent.render(width));
+		const rendered = plain(agentLines);
 
-	assert((agent as unknown as { getRenderShell(): string }).getRenderShell() === "default", "Agent shell was overridden");
-	assert(callRendered && resultRendered, "Agent native renderers were not used");
-	assert(rendered.includes("Native Agent call"), `Agent native call missing: ${rendered}`);
-	assert(rendered.includes("Native Agent result"), `Agent native result missing: ${rendered}`);
-	assert(!rendered.includes("full agent result"), "Agent fell back to generic text output");
-	console.log("OK  Agent renderer: native subagent output stays unchanged");
+		assert((agent as unknown as { getRenderShell(): string }).getRenderShell() === "default", "Agent shell was overridden");
+		assert(agentLines.some((line) => line.includes(theme.getBgAnsi("toolSuccessBg"))), "Agent background was missing");
+		assert(callRendered && resultRendered, "Agent native renderers were not used");
+		assert(rendered.includes("Native Agent call"), `Agent native call missing: ${rendered}`);
+		assert(rendered.includes("Native Agent result"), `Agent native result missing: ${rendered}`);
+		assert(!rendered.includes("full agent result"), "Agent fell back to generic text output");
+
+		const customDefinition: ToolDefinition = {
+			name: "custom",
+			label: "custom",
+			description: "test",
+			parameters: {},
+			renderCall: () => new Text("Custom call", 0, 0),
+			renderResult: () => new Text("Custom result", 0, 0),
+		};
+		const custom = new ToolExecutionComponent(
+			"custom",
+			"test-custom-background",
+			{},
+			{ showImages: false },
+			customDefinition as never,
+			fakeUi as never,
+			transparentCwd,
+		);
+		custom.markExecutionStarted();
+		custom.updateResult({ content: [{ type: "text", text: "result" }] } as never, false);
+		const customLines = ensureArray(custom.render(width));
+		assert((custom as unknown as { getRenderShell(): string }).getRenderShell() === "self", "non-Agent shell kept its background");
+		assert(!customLines.some((line) => line.includes(theme.getBgAnsi("toolSuccessBg"))), "non-Agent background was present");
+		console.log("OK  Agent renderer: only subagent output keeps the native background");
+	} finally {
+		rmSync(transparentCwd, { recursive: true, force: true });
+	}
 }
 
 // Ordinary assistant content stays on Pi's native renderer without horizontal padding.
@@ -399,7 +436,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	console.log("OK  first message: one top spacer without changing later spacing");
 }
 
-// Pi's default empty widget spacer must not look like a stopped working row.
+// Keep Pi's native one-line gap between transcript output and the editor.
 {
 	const renderWidgetContainer = (InteractiveMode.prototype as unknown as {
 		renderWidgetContainer(
@@ -411,7 +448,8 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	}).renderWidgetContainer;
 	const container = new Container();
 	renderWidgetContainer.call({}, container, new Map(), true, true);
-	assert(container.children.length === 0, "empty widget container retained a spacer");
+	assert(container.children.length === 1, "empty widget container lost the native spacer");
+	assert(container.children[0]?.constructor.name === "Spacer", "empty widget gap was not a spacer");
 
 	renderWidgetContainer.call(
 		{},
@@ -421,7 +459,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		true,
 	);
 	assert(container.children.length === 2, "non-empty widget spacing changed");
-	console.log("OK  idle layout: empty working/widget area leaves no placeholder");
+	console.log("OK  idle layout: native one-line editor gap is preserved");
 }
 
 // Pi's native working indicator remains visible while the agent is streaming.

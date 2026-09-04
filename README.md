@@ -12,9 +12,9 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - Failed tool results keep only the first error line visible.
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
 - MCP and unknown custom tools use the same unboxed compact fallback renderer and show the first partial progress line while running.
-- `Agent` / subagent tools keep their own registered renderers and output style unchanged.
+- `Agent` / subagent tools keep their own registered renderers and native background; other tools remain transparent in non-default background modes.
 - Thinking content stays hidden; streaming updates show `Thinking for 1.2s`, then collapse to `Thought for 1.2s` in Catppuccin Macchiato Subtext 0 (`#a5adcb`).
-- Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row and the empty widget spacer when the run ends.
+- Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row while retaining the native one-line gap above the editor.
 - Syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
 
@@ -32,7 +32,7 @@ Pi reads global settings from `~/.pi/agent/settings.json` and project settings f
 }
 ```
 
-`toolBackground` accepts `default`, `transparent`, `outlines`, or the legacy alias `border`. The compact renderer removes full-width background fills for the non-default modes; it intentionally does not add border rows to the hot path.
+`toolBackground` accepts `default`, `transparent`, `outlines`, or the legacy alias `border`. In non-default modes, the compact renderer removes full-width background fills from tools other than `Agent`; subagent output keeps its native status background. The renderer intentionally does not add border rows to the hot path.
 
 `diffRenderer` accepts `plain` (default), `delta`, or `auto`. `delta` / `auto` use a local `delta` executable for compact `write` / `edit` diff previews during tool execution, with file headers, hunk headers, and delta line-number columns omitted. Catppuccin Macchiato diff colors are passed explicitly when `diffTheme` is `catppuccin-macchiato`. Rendering has a timeout and automatic fallback to plain diff when unavailable.
 
