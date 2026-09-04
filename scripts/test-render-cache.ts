@@ -123,7 +123,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 // Ctrl+O still expands the full result.
 {
 	const component = toolComponent("read", { path: "src/index.ts" }, {
-		content: [{ type: "text", text: "line one\nline two\nline three\nline four\nline five\nline six\nline seven" }],
+		content: [{ type: "text", text: "line one\n\nline two\n   \nline three\nline four\nline five\nline six\nline seven" }],
 	});
 	const collapsed = plain(component.render(width));
 	assert(collapsed.includes("● Read src/index.ts"), "collapsed read call style changed");
@@ -156,7 +156,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	component.markExecutionStarted();
 	component.setArgsComplete();
 	component.updateResult({
-		content: [{ type: "text", text: "line one\nline two\nline three\nline four\nline five\nline six\nline seven with a deliberately long suffix that must be clipped at narrow terminal widths" }],
+		content: [{ type: "text", text: "line one\nline two\nline three\nline four\nline five\n\nline six\n   \nline seven with a deliberately long suffix that must be clipped at narrow terminal widths" }],
 	} as never, true);
 	const live = plain(component.render(width));
 	const narrow = ensureArray(component.render(36));

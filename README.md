@@ -7,8 +7,8 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - Built-in tools keep one compact call row: `read`, `bash`, `grep`, `find`, `ls`, `write`, and `edit`.
 - A quiet new session keeps one blank row above its first user message.
 - Assistant text, thinking labels, tool calls/results, custom tools, todo panels, and subagent panels render without left indentation so they can use the full terminal width.
-- Collapsed successful results show the first 3 width-bounded output lines in muted gray plus a dim `… +N lines (ctrl+o to expand)` hint; file-changing `write` and `edit` results show `+N -N` plus a bounded compact diff preview.
-- Running `bash` tools show a live 3-line tail preview and elapsed time; completed rows retain a dim duration.
+- Collapsed successful results show the first 3 non-empty, width-bounded output lines in muted gray plus a dim `… +N lines (ctrl+o to expand)` hint; file-changing `write` and `edit` results show `+N -N` plus a bounded compact diff preview.
+- Running `bash` tools show a live 3-line non-empty tail preview and elapsed time; completed rows retain a dim duration.
 - Failed tool results keep only the first error line visible.
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
 - MCP and unknown custom tools use the same unboxed compact fallback renderer and show the first partial progress line while running.

@@ -676,11 +676,17 @@ function previewComponent(content: string[], theme: Theme, context: RenderContex
 	return component;
 }
 
-function collapsedPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
-	const normalized = textBlocks(result).join("\n").replace(/\r/g, "").trim();
-	if (!normalized) return undefined;
+function previewTextLines(result: TextResult): string[] {
+	return textBlocks(result)
+		.join("\n")
+		.replace(/\r/g, "")
+		.split("\n")
+		.filter((line) => line.trim().length > 0);
+}
 
-	const allLines = normalized.split("\n");
+function collapsedPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
+	const allLines = previewTextLines(result);
+	if (allLines.length === 0) return undefined;
 	const lines = allLines
 		.slice(0, COLLAPSED_PREVIEW_LINES)
 		.map((line) => theme.fg("muted", line));
@@ -697,10 +703,8 @@ function collapsedPreview(result: TextResult, theme: Theme, context: RenderConte
 }
 
 function liveTailPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
-	const normalized = textBlocks(result).join("\n").replace(/\r/g, "").trim();
-	if (!normalized) return undefined;
-
-	const allLines = normalized.split("\n");
+	const allLines = previewTextLines(result);
+	if (allLines.length === 0) return undefined;
 	const lines = allLines.length > COLLAPSED_PREVIEW_LINES ? [theme.fg("dim", "…")] : [];
 	lines.push(...allLines.slice(-COLLAPSED_PREVIEW_LINES).map((line) => theme.fg("muted", line)));
 	return previewComponent(lines, theme, context);
