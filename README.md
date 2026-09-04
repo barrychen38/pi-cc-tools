@@ -7,14 +7,15 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - Built-in tools keep one compact call row: `read`, `bash`, `grep`, `find`, `ls`, `write`, and `edit`.
 - A quiet new session keeps one blank row above its first user message.
 - Assistant text, thinking labels, tool calls/results, custom tools, todo panels, and subagent panels render without left indentation so they can use the full terminal width.
-- Collapsed successful results show the first 3 output lines in muted gray plus a dim `… +N lines (ctrl+o to expand)` hint; file-changing `write` and `edit` results show `+N -N` plus a bounded compact diff preview.
+- Collapsed successful results show the first 3 width-bounded output lines in muted gray plus a dim `… +N lines (ctrl+o to expand)` hint; file-changing `write` and `edit` results show `+N -N` plus a bounded compact diff preview.
+- Running `bash` tools show a live 3-line tail preview and elapsed time; completed rows retain a dim duration.
 - Failed tool results keep only the first error line visible.
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
-- MCP and unknown custom tools use the same unboxed compact fallback renderer.
+- MCP and unknown custom tools use the same unboxed compact fallback renderer and show the first partial progress line while running.
 - `Agent` / subagent tools keep their own registered renderers and output style unchanged.
 - Thinking content stays hidden; streaming updates show `Thinking for 1.2s`, then collapse to `Thought for 1.2s` in Catppuccin Macchiato Subtext 0 (`#a5adcb`).
 - Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row and the empty widget spacer when the run ends.
-- Tool-output live previews, syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
+- Syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
 
 The extension does not load a syntax highlighter or add a general-purpose refresh timer. `write` reads the previous file once to calculate its bounded line-count summary and diff preview; `edit` reuses Pi's existing result metadata for the same output shape.

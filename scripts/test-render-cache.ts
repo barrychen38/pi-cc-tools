@@ -119,7 +119,7 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(fakePi.tools.has(name), `missing built-in override: ${name}`);
 }
 
-// Successful results show a bounded 5-line head preview in collapsed mode;
+// Successful results show a width-bounded 3-line head preview in collapsed mode;
 // Ctrl+O still expands the full result.
 {
 	const component = toolComponent("read", { path: "src/index.ts" }, {
@@ -136,11 +136,11 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	const expanded = plain(component.render(width));
 	assert(expanded.includes("└─ line one"), "expanded result did not keep branch styling");
 	assert(expanded.includes("line seven"), "expanded result did not include tail lines");
-	console.log("OK  built-in renderer: collapsed 5-line preview + styled expanded result");
+	console.log("OK  built-in renderer: collapsed 3-line preview + styled expanded result");
 }
 
-// Partial results never render live previews; the call remains a static
-// pending dot, so no interval or invalidation loop is needed.
+// Bash partial results show a width-bounded 3-line tail preview and elapsed
+// time, then clear the live timer and retain a compact duration on completion.
 {
 	const definition = fakePi.tools.get("bash");
 	assert(definition, "missing bash definition");
@@ -154,9 +154,23 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		cwd,
 	);
 	component.markExecutionStarted();
-	const pending = plain(component.render(width));
-	assert(pending.includes("○ Bash $ printf hello"), "pending call did not use static status dot");
-	console.log("OK  pending renderer: no live output preview");
+	component.setArgsComplete();
+	component.updateResult({
+		content: [{ type: "text", text: "line one\nline two\nline three\nline four\nline five\nline six\nline seven with a deliberately long suffix that must be clipped at narrow terminal widths" }],
+	} as never, true);
+	const live = plain(component.render(width));
+	const narrow = ensureArray(component.render(36));
+	component.updateResult({ content: [{ type: "text", text: "done" }] } as never, false);
+	const completed = plain(component.render(width));
+
+	assert(live.includes("○ Bash $ printf hello"), "pending call did not use pending status dot");
+	assert(/\(\d+\.\d+s\)/.test(live), "pending bash call did not show elapsed time");
+	assert(live.includes("└─ …"), "live bash preview did not mark hidden earlier output");
+	assert(live.includes("line five"), "live bash preview omitted the tail");
+	assert(!live.includes("line four"), "live bash preview exceeded 3 lines");
+	assert(narrow.every((line) => visibleWidth(line) <= 36), "live bash preview exceeded render width");
+	assert(/took \d+\.\d+s/.test(completed), "completed bash result did not retain duration");
+	console.log("OK  bash renderer: live 3-line tail + elapsed/took timing");
 }
 
 // Errors stay visible but are reduced to the first line when collapsed.
@@ -181,10 +195,25 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		description: "test",
 		parameters: {},
 	};
-	const component = toolComponent("mcp__demo__search", { query: "needle" }, {
+	const component = new ToolExecutionComponent(
+		"mcp__demo__search",
+		"test-mcp-preview",
+		{ query: "needle" },
+		{ showImages: false },
+		custom as never,
+		fakeUi as never,
+		cwd,
+	);
+	component.markExecutionStarted();
+	component.setArgsComplete();
+	component.updateResult({ content: [{ type: "text", text: "Searching remote source...\nignored detail" }] } as never, true);
+	const partial = plain(component.render(width));
+	component.updateResult({
 		content: [{ type: "text", text: "custom result\nsecond line\nthird line\nfourth line\nfifth line\nsixth line" }],
-	}, custom);
+	} as never, false);
 	const collapsed = plain(component.render(width));
+	assert(partial.includes("└─ Searching remote source..."), "generic custom partial progress was hidden");
+	assert(!partial.includes("ignored detail"), "generic custom partial progress exceeded one line");
 	assert(collapsed.includes("● MCP needle"), "generic custom call renderer was not installed");
 	assert(collapsed.includes("└─ custom result"), "generic custom result did not show first-line summary");
 	assert(collapsed.includes("… +3 lines (ctrl+o to expand)"), "generic custom result missing truncation hint");

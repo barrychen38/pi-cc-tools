@@ -21,6 +21,7 @@ import {
 	Editor,
 	Spacer,
 	Text,
+	truncateToWidth,
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type AutocompleteSuggestions,
@@ -33,9 +34,18 @@ type RenderContext = {
 	cwd: string;
 	isPartial: boolean;
 	isError: boolean;
+	executionStarted?: boolean;
 	args?: unknown;
 	toolCallId?: string;
 	invalidate?: () => void;
+	lastComponent?: Component;
+	state?: Record<PropertyKey, unknown>;
+};
+
+type BashRenderState = {
+	startedAt?: number;
+	endedAt?: number;
+	interval?: NodeJS.Timeout;
 };
 
 type DiffRenderer = "plain" | "delta" | "auto";
@@ -552,10 +562,16 @@ function statusDot(context: RenderContext, theme: Theme): string {
 	return theme.fg("success", "●");
 }
 
-function renderCallLine(label: string, summary: string, theme: Theme, context: RenderContext): Text {
+function renderCallLine(
+	label: string,
+	summary: string,
+	theme: Theme,
+	context: RenderContext,
+	note = "",
+): Text {
 	const title = theme.fg("toolTitle", theme.bold(label));
 	const suffix = summary ? ` ${theme.fg("accent", summary)}` : "";
-	return toolText(`${statusDot(context, theme)} ${title}${suffix}`);
+	return toolText(`${statusDot(context, theme)} ${title}${suffix}${note}`);
 }
 
 function textBlocks(result: TextResult): string[] {
@@ -613,19 +629,81 @@ function expandedText(result: TextResult, maxLines: number): string {
 	return output;
 }
 
-function collapsedPreview(result: TextResult, theme: Theme): Text | undefined {
-	const joined = textBlocks(result).join("\n");
-	if (!joined.trim()) return undefined;
+class WidthAwarePreview implements Component {
+	private sourceLines: string[] = [];
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
 
-	const total = joined.replace(/\r/g, "").trim().split("\n").length;
-	const { text: head, truncated } = takeLines(joined, COLLAPSED_PREVIEW_LINES);
-	const lines = head.split("\n");
-	if (lines.at(-1) === "…") lines.pop();
-	if (truncated) {
-		const hidden = total - COLLAPSED_PREVIEW_LINES;
+	setLines(lines: string[]): void {
+		this.sourceLines = lines;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines === undefined || this.cachedWidth !== width) {
+			this.cachedWidth = width;
+			this.cachedLines = this.sourceLines.map((line) => truncateToWidth(line, width, "…"));
+		}
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+}
+
+function formatDuration(ms: number): string {
+	return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function bashState(context: RenderContext): BashRenderState {
+	context.state ??= {};
+	return context.state as BashRenderState;
+}
+
+function branchLines(content: string[], theme: Theme): string[] {
+	const rule = theme.fg("borderMuted", "└─");
+	const continuation = theme.fg("borderMuted", "│");
+	return content.map((line, index) => index === 0 ? `${rule} ${line}` : `${continuation}  ${line}`);
+}
+
+function previewComponent(content: string[], theme: Theme, context: RenderContext): Component {
+	const component = context.lastComponent instanceof WidthAwarePreview
+		? context.lastComponent
+		: new WidthAwarePreview();
+	component.setLines(branchLines(content, theme));
+	return component;
+}
+
+function collapsedPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
+	const normalized = textBlocks(result).join("\n").replace(/\r/g, "").trim();
+	if (!normalized) return undefined;
+
+	const allLines = normalized.split("\n");
+	const lines = allLines
+		.slice(0, COLLAPSED_PREVIEW_LINES)
+		.map((line) => theme.fg("muted", line));
+	if (allLines.length > COLLAPSED_PREVIEW_LINES) {
+		const hidden = allLines.length - COLLAPSED_PREVIEW_LINES;
 		lines.push(theme.fg("dim", `… +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)`));
 	}
-	return toolText(branchBlock(lines.map((line) => theme.fg("muted", line)).join("\n"), theme));
+
+	const state = context.state as BashRenderState | undefined;
+	if (state?.startedAt !== undefined && state.endedAt !== undefined) {
+		lines.push(theme.fg("dim", `took ${formatDuration(state.endedAt - state.startedAt)}`));
+	}
+	return previewComponent(lines, theme, context);
+}
+
+function liveTailPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
+	const normalized = textBlocks(result).join("\n").replace(/\r/g, "").trim();
+	if (!normalized) return undefined;
+
+	const allLines = normalized.split("\n");
+	const lines = allLines.length > COLLAPSED_PREVIEW_LINES ? [theme.fg("dim", "…")] : [];
+	lines.push(...allLines.slice(-COLLAPSED_PREVIEW_LINES).map((line) => theme.fg("muted", line)));
+	return previewComponent(lines, theme, context);
 }
 
 function branchBlock(content: string, theme: Theme): string {
@@ -642,8 +720,8 @@ function renderMinimalResult(
 	expanded: boolean,
 	theme: Theme,
 	context: RenderContext,
-): Text {
-	if (context.isPartial) return emptyText();
+): Component {
+	if (context.isPartial) return liveTailPreview(result, theme, context) ?? emptyText();
 
 	const settings = readSettings(context.cwd);
 	const maxLines = typeof settings.expandedPreviewMaxLines === "number" && settings.expandedPreviewMaxLines > 0
@@ -657,7 +735,7 @@ function renderMinimalResult(
 	}
 
 	if (!expanded) {
-		return collapsedPreview(result, theme) ?? emptyText();
+		return collapsedPreview(result, theme, context) ?? emptyText();
 	}
 
 	const raw = expandedText(result, maxLines);
@@ -983,7 +1061,7 @@ function renderWriteEditResult(
 	options: { expanded: boolean },
 	theme: Theme,
 	context: RenderContext,
-): Text {
+): Component {
 	if (context.isPartial) return emptyText();
 
 	const summary = writeEditSummary(result);
@@ -1020,8 +1098,28 @@ function renderBuiltinResult(
 	options: { expanded: boolean },
 	theme: Theme,
 	context: RenderContext,
-): Text {
+): Component {
 	return renderMinimalResult(result, options.expanded, theme, context);
+}
+
+function renderBashResult(
+	result: TextResult,
+	options: { expanded: boolean },
+	theme: Theme,
+	context: RenderContext,
+): Component {
+	const state = bashState(context);
+	if (state.startedAt !== undefined && context.isPartial && state.interval === undefined) {
+		state.interval = setInterval(() => context.invalidate?.(), 1_000);
+	}
+	if (state.startedAt !== undefined && (!context.isPartial || context.isError)) {
+		state.endedAt ??= Date.now();
+		if (state.interval !== undefined) {
+			clearInterval(state.interval);
+			state.interval = undefined;
+		}
+	}
+	return renderBuiltinResult(result, options, theme, context);
 }
 
 function genericLabel(name: string): string {
@@ -1054,8 +1152,12 @@ function renderGenericResult(
 	options: { expanded: boolean },
 	theme: Theme,
 	context: RenderContext,
-): Text {
-	if (context.isPartial) return emptyText();
+): Component {
+	if (context.isPartial) {
+		const first = firstTextLine(result);
+		if (!first || first === "Tool failed") return emptyText();
+		return previewComponent([theme.fg("muted", oneLine(first, 120))], theme, context);
+	}
 
 	if (context.isError) {
 		const raw = options.expanded
@@ -1066,7 +1168,7 @@ function renderGenericResult(
 	}
 
 	if (!options.expanded) {
-		return collapsedPreview(result, theme) ?? emptyText();
+		return collapsedPreview(result, theme, context) ?? emptyText();
 	}
 
 	const raw = expandedText(result, DEFAULT_EXPANDED_LINES);
@@ -1226,12 +1328,20 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 			return getBuiltInTools(ctx.cwd).bash.execute(toolCallId, params, signal, onUpdate);
 		},
 		renderCall(args, theme, context) {
+			const state = bashState(context);
+			if (context.executionStarted && state.startedAt === undefined) {
+				state.startedAt = Date.now();
+				state.endedAt = undefined;
+			}
 			const command = oneLine(stringArg(args, "command"), 96) || "...";
 			const timeout = numberArg(args, "timeout");
 			const suffix = timeout === undefined ? "" : ` (timeout ${timeout}s)`;
-			return renderCallLine("Bash", `$ ${command}${suffix}`, theme, context);
+			const note = context.isPartial && state.startedAt !== undefined
+				? ` ${theme.fg("dim", `(${formatDuration(Date.now() - state.startedAt)})`)}`
+				: "";
+			return renderCallLine("Bash", `$ ${command}${suffix}`, theme, context, note);
 		},
-		renderResult: renderBuiltinResult,
+		renderResult: renderBashResult,
 	});
 
 	pi.registerTool({
