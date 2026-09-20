@@ -46,6 +46,7 @@ class FakeEventBus extends Map<string, Array<(...args: unknown[]) => unknown>> {
 class FakePi {
 	tools = new Map<string, ToolDefinition>();
 	events = new FakeEventBus();
+	commands: Array<{ name: string; source: string; sourceInfo: { path: string; baseDir?: string } }> = [];
 
 	registerTool(definition: ToolDefinition): void {
 		this.tools.set(definition.name, definition);
@@ -53,6 +54,7 @@ class FakePi {
 
 	registerCommand(): void {}
 	registerShortcut(): void {}
+	getCommands() { return this.commands; }
 
 	on(name: string, handler: (...args: unknown[]) => unknown): void {
 		this.events.on(name, handler);
@@ -119,6 +121,17 @@ function toolComponent(
 for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(fakePi.tools.has(name), `missing built-in override: ${name}`);
 }
+
+// Built-in overrides retain behavioral metadata added by Pi, not only their
+// schema and executor.
+for (const name of ["read", "bash", "write", "edit"]) {
+	const definition = fakePi.tools.get(name);
+	assert(definition?.constrainedSampling, `${name} lost constrained sampling metadata`);
+}
+assert(typeof fakePi.tools.get("edit")?.prepareArguments === "function", "edit lost legacy argument preparation");
+assert(typeof fakePi.tools.get("bash")?.promptSnippet === "string", "bash lost its prompt snippet");
+assert(Array.isArray(fakePi.tools.get("bash")?.promptGuidelines), "bash lost its prompt guidelines");
+console.log("OK  built-in metadata: constrained sampling and compatibility fields are preserved");
 
 // Successful results show a width-bounded 3-line head preview in collapsed mode;
 // Ctrl+O still expands the full result.
@@ -420,6 +433,9 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		},
 		getMarkdownThemeWithSettings() {
 			return undefined;
+		},
+		getMarkdownTransformers() {
+			return [];
 		},
 		toolOutputExpanded: false,
 		editor: {},
@@ -740,6 +756,9 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		const writeOutput = plain(ensureArray(writeComponent.render(width)));
 		assert(writeOutput.includes("+1 -1"), `write replacement summary was wrong: ${writeOutput}`);
 		assert(writeOutput.includes("-2 old") && writeOutput.includes("+2 new"), `write diff content missing: ${writeOutput}`);
+		const restoredWriteResult = JSON.parse(JSON.stringify(writeResult)) as Record<string, unknown>;
+		const restoredWriteOutput = plain(ensureArray(toolComponent("write", writeArgs, restoredWriteResult, writeDefinition).render(width)));
+		assert(restoredWriteOutput.includes("+1 -1"), `serialized write summary was lost: ${restoredWriteOutput}`);
 
 		const editDefinition = fakePi.tools.get("edit");
 		assert(editDefinition?.execute, "missing edit execute override");
@@ -808,6 +827,37 @@ for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		else process.env.PATH = previousPath;
 		if (previousRenderer === undefined) delete process.env.PI_CC_TOOLS_DIFF_RENDERER;
 		else process.env.PI_CC_TOOLS_DIFF_RENDERER = previousRenderer;
+		rmSync(tempDirectory, { recursive: true, force: true });
+	}
+}
+
+// ── Referenced skills use transcript-aware structured prompt sections ──
+{
+	const tempDirectory = mkdtempSync(join(tmpdir(), "pi-cc-tools-skill-section-"));
+	try {
+		const skillPath = join(tempDirectory, "SKILL.md");
+		writeFileSync(skillPath, "---\nname: demo\n---\n\nFollow the demo workflow.\n");
+		fakePi.commands = [{
+			name: "skill:demo",
+			source: "skill",
+			sourceInfo: { path: skillPath, baseDir: tempDirectory },
+		}];
+		const event = {
+			prompt: "Use $demo for this task",
+			systemPrompt: "base prompt",
+			systemPromptOptions: { sections: {} as Record<string, string> },
+		};
+		let result: unknown;
+		for (const handler of fakePi.events.get("before_agent_start") ?? []) {
+			result = await handler(event, { hasUI: false, cwd, ui: {} });
+		}
+		assert(result === undefined, "referenced skill forced a full system prompt replacement");
+		const section = event.systemPromptOptions.sections.referenced_skills;
+		assert(section?.includes("Follow the demo workflow."), "referenced skill section was not populated");
+		assert(!section.includes("<referenced_skills>"), "structured section redundantly included its XML wrapper");
+		console.log("OK  prompt patch: referenced skills use a structured transcript section");
+	} finally {
+		fakePi.commands = [];
 		rmSync(tempDirectory, { recursive: true, force: true });
 	}
 }

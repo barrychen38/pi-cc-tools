@@ -185,14 +185,13 @@ function collectReferencedSkillBlocks(
 	return blocks;
 }
 
-function appendReferencedSkillsToSystemPrompt(
-	systemPrompt: string,
+function buildReferencedSkillsSection(
 	text: string,
 	commands: readonly { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[],
 ): string | undefined {
 	const blocks = collectReferencedSkillBlocks(text, commands);
 	if (blocks.length === 0) return undefined;
-	return `${systemPrompt}\n\n<referenced_skills>\nThe user referenced these skills with $name tokens in their prompt. Apply the matching skill instructions while preserving the user's original wording as the task request.\n\n${blocks.join("\n\n")}\n</referenced_skills>`;
+	return `The user referenced these skills with $name tokens in their prompt. Apply the matching skill instructions while preserving the user's original wording as the task request.\n\n${blocks.join("\n\n")}`;
 }
 
 function createSkillTriggerProvider(current: AutocompleteProvider): AutocompleteProvider {
@@ -337,16 +336,12 @@ function patchAssistantContentPadding(): void {
 	if (typeof original !== "function") return;
 
 	proto.updateContent = function patchedAssistantContentPadding(this: {
-		contentContainer?: { children?: Component[] };
+		outputPad?: number;
 	}, message: Record<string, unknown>) {
-		const result = original.call(this, message);
-		for (const child of this.contentContainer?.children ?? []) {
-			const paddedChild = child as Component & { paddingX?: number };
-			if (typeof paddedChild.paddingX !== "number" || paddedChild.paddingX === 0) continue;
-			paddedChild.paddingX = 0;
-			paddedChild.invalidate();
-		}
-		return result;
+		// Pi 0.86 wraps thinking blocks in MouseRegion, so clearing padding on
+		// direct children no longer reaches every rendered content component.
+		this.outputPad = 0;
+		return original.call(this, message);
 	};
 	proto[ASSISTANT_CONTENT_PADDING_PATCH] = true;
 }
@@ -705,8 +700,11 @@ function renderMinimalResult(
 
 type DiffSummary = { added: number; removed: number; newFile: boolean };
 
-const WRITE_EDIT_DIFF = Symbol.for("pi-cc-tools:write-edit-diff");
-const WRITE_EDIT_RENDERED_DIFF = Symbol.for("pi-cc-tools:write-edit-rendered-diff");
+const WRITE_EDIT_DETAILS_KEY = "piCcTools";
+type WriteEditDetails = {
+	diffSummary?: DiffSummary;
+	renderedDiff?: string;
+};
 const FILE_DIFF_PREVIEW_LINES = 80;
 const DIFF_CONTEXT_LINES = 3;
 const MAX_LINE_DIFF_CELLS = 1_000_000;
@@ -966,10 +964,16 @@ async function renderDeltaForPatch(patch: string | undefined, cwd: string): Prom
 }
 
 function attachDiffSummary(result: TextResult, summary: DiffSummary, diff?: string, renderedDiff?: string): void {
-	const details = result.details && typeof result.details === "object" ? result.details : {};
-	(details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] = summary;
-	if (diff) (details as { diff?: string }).diff = diff;
-	if (renderedDiff) (details as Record<PropertyKey, unknown>)[WRITE_EDIT_RENDERED_DIFF] = renderedDiff;
+	const details = result.details && typeof result.details === "object" && !Array.isArray(result.details)
+		? result.details as Record<string, unknown>
+		: {};
+	const previous = details[WRITE_EDIT_DETAILS_KEY];
+	const extensionDetails: WriteEditDetails = previous && typeof previous === "object" && !Array.isArray(previous)
+		? { ...(previous as WriteEditDetails), diffSummary: summary }
+		: { diffSummary: summary };
+	if (renderedDiff) extensionDetails.renderedDiff = renderedDiff;
+	details[WRITE_EDIT_DETAILS_KEY] = extensionDetails;
+	if (diff) details.diff = diff;
 	(result as { details?: unknown }).details = details;
 }
 
@@ -992,8 +996,10 @@ function editDiff(result: TextResult): string | undefined {
 }
 
 function renderedDiff(result: TextResult): string | undefined {
-	return result.details && typeof result.details === "object"
-		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_RENDERED_DIFF] as string | undefined
+	if (!result.details || typeof result.details !== "object" || Array.isArray(result.details)) return undefined;
+	const extensionDetails = (result.details as Record<string, unknown>)[WRITE_EDIT_DETAILS_KEY];
+	return extensionDetails && typeof extensionDetails === "object" && !Array.isArray(extensionDetails)
+		? (extensionDetails as WriteEditDetails).renderedDiff
 		: undefined;
 }
 
@@ -1011,8 +1017,10 @@ function colorDiffText(diff: string, theme: Theme, maxLines: number): string {
 }
 
 function writeEditSummary(result: TextResult): DiffSummary | undefined {
-	return result.details && typeof result.details === "object"
-		? (result.details as Record<PropertyKey, unknown>)[WRITE_EDIT_DIFF] as DiffSummary | undefined
+	if (!result.details || typeof result.details !== "object" || Array.isArray(result.details)) return undefined;
+	const extensionDetails = (result.details as Record<string, unknown>)[WRITE_EDIT_DETAILS_KEY];
+	return extensionDetails && typeof extensionDetails === "object" && !Array.isArray(extensionDetails)
+		? (extensionDetails as WriteEditDetails).diffSummary
 		: undefined;
 }
 
@@ -1256,10 +1264,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	const tools = getBuiltInTools(cwd);
 
 	pi.registerTool({
-		name: "read",
+		...tools.read,
 		label: "read",
-		description: tools.read.description,
-		parameters: tools.read.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return getBuiltInTools(ctx.cwd).read.execute(toolCallId, params, signal, onUpdate);
@@ -1280,10 +1286,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "bash",
+		...tools.bash,
 		label: "bash",
-		description: tools.bash.description,
-		parameters: tools.bash.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return getBuiltInTools(ctx.cwd).bash.execute(toolCallId, params, signal, onUpdate);
@@ -1306,10 +1310,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "grep",
+		...tools.grep,
 		label: "grep",
-		description: tools.grep.description,
-		parameters: tools.grep.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return getBuiltInTools(ctx.cwd).grep.execute(toolCallId, params, signal, onUpdate);
@@ -1325,10 +1327,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "find",
+		...tools.find,
 		label: "find",
-		description: tools.find.description,
-		parameters: tools.find.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return getBuiltInTools(ctx.cwd).find.execute(toolCallId, params, signal, onUpdate);
@@ -1344,10 +1344,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "ls",
+		...tools.ls,
 		label: "ls",
-		description: tools.ls.description,
-		parameters: tools.ls.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return getBuiltInTools(ctx.cwd).ls.execute(toolCallId, params, signal, onUpdate);
@@ -1362,10 +1360,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "write",
+		...tools.write,
 		label: "write",
-		description: tools.write.description,
-		parameters: tools.write.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const fp = stringArg(params, "path");
@@ -1396,10 +1392,8 @@ function registerBuiltInTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "edit",
+		...tools.edit,
 		label: "edit",
-		description: tools.edit.description,
-		parameters: tools.edit.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const result = await getBuiltInTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate);
@@ -1438,9 +1432,19 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		resetSettingsCache();
 		configureMinimalUi(ctx);
-		if (typeof event.prompt !== "string" || typeof event.systemPrompt !== "string" || !event.prompt.includes(SKILL_TRIGGER)) return;
-		const systemPrompt = appendReferencedSkillsToSystemPrompt(event.systemPrompt, event.prompt, pi.getCommands());
-		return systemPrompt ? { systemPrompt } : undefined;
+		const section = typeof event.prompt === "string" && event.prompt.includes(SKILL_TRIGGER)
+			? buildReferencedSkillsSection(event.prompt, pi.getCommands())
+			: undefined;
+		const sections = event.systemPromptOptions?.sections;
+		if (sections) {
+			if (section) sections.referenced_skills = section;
+			else delete sections.referenced_skills;
+			return;
+		}
+		// Compatibility fallback for Pi versions before structured prompt options.
+		if (section && typeof event.systemPrompt === "string") {
+			return { systemPrompt: `${event.systemPrompt}\n\n<referenced_skills>\n${section}\n</referenced_skills>` };
+		}
 	});
 	pi.on("agent_start", async (_event, ctx) => {
 		configureMinimalUi(ctx);

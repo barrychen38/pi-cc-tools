@@ -55,4 +55,4 @@ npm run bench:tools -- baseline 120 12 8
 npm run bench:tools -- minimal 120 12 8
 ```
 
-The extension uses Pi's public `registerTool`, `renderCall`, and `renderResult` interfaces. Small component-level fallbacks keep MCP/custom tool shells compact and replace thinking content with an elapsed-time label.
+The extension is verified against Pi 0.86.0 and preserves built-in tool metadata such as constrained sampling and argument preparation when installing compact renderers. Referenced `$skill` instructions use transcript-aware prompt sections on supported Pi versions. Small component-level fallbacks keep MCP/custom tool shells compact and replace thinking content with an elapsed-time label.

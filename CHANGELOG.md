@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- Added Pi 0.86 compatibility for wrapped thinking components so hidden thinking labels remain flush-left.
+- Preserved Pi's built-in tool metadata when applying compact renderers, including constrained sampling, argument preparation, execution mode, and prompt guidance.
+- Stored `write` / `edit` render metadata under JSON-compatible namespaced keys so summaries survive session serialization.
+- Updated the interactive-mode test harness for Pi's Markdown transformer pipeline.
+
 ### Changed
 
+- Referenced `$skill` instructions now use Pi's transcript-aware structured system-prompt sections, preserving prompt-cache prefixes on Pi 0.86 while retaining a fallback for older Pi versions.
+- Development and lockfile verification now target Pi 0.86.0.
 - `Agent` / subagent output now keeps its native status background in transparent/outline modes while all other tool shells remain transparent.
 - Restored Pi's native one-line gap between transcript output and the input editor.
 - Collapsed successful results now show the first 3 non-empty, width-bounded output lines in muted gray with a dim `… +N lines (ctrl+o to expand)` hint instead of a bare line count; applies to built-in and MCP/custom tools alike.
