@@ -514,11 +514,21 @@ function renderCallLine(
 	return toolText(`${statusDot(context, theme)} ${title}${suffix}${note}`);
 }
 
+// Tool output is data, not terminal instructions. Keep only SGR styling;
+// consume string controls (including unfinished streaming sequences) as a unit.
+// Pi's stripTerminalSequences also removes colors, so it cannot be used here.
+function safeResultText(text: string): string {
+	return text.replace(
+		/(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|$)|(?:\x1b[P_X^]|[\x90\x98\x9e\x9f])[^\x1b\x9c]*(?:\x1b\\|\x9c|$)|(?:\x1b\[|\x9b)[0-?]*[ -/]*(?:[@-~]|$)|\x1b[ -/]*(?:[0-~]|$)|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g,
+		(sequence) => /^\x1b\[[0-9;:]*m$/.test(sequence) ? sequence : "",
+	);
+}
+
 function textBlocks(result: TextResult): string[] {
 	const blocks: string[] = [];
 	for (const block of result.content) {
 		if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
-			blocks.push(block.text);
+			blocks.push(safeResultText(block.text));
 		}
 	}
 	return blocks;
@@ -1034,7 +1044,8 @@ function renderWriteEditResult(
 	const diff = renderedDiff(result) ?? editDiff(result);
 	if (diff) {
 		const maxLines = options.expanded ? DEFAULT_EXPANDED_LINES : FILE_DIFF_PREVIEW_LINES;
-		const diffOutput = renderedDiff(result) ? takeLines(diff, maxLines).text : colorDiffText(diff, theme, maxLines);
+		const safeDiff = safeResultText(diff);
+		const diffOutput = renderedDiff(result) ? takeLines(safeDiff, maxLines).text : colorDiffText(safeDiff, theme, maxLines);
 		const output = [diffSummaryLine(summary, theme), diffOutput].filter(Boolean).join("\n");
 		return toolText(branchBlock(output, theme));
 	}
@@ -1113,7 +1124,7 @@ function renderGenericResult(
 	if (context.isPartial) {
 		const first = firstTextLine(result);
 		if (!first || first === "Tool failed") return emptyText();
-		return previewComponent([theme.fg("muted", oneLine(first, 120))], theme, context);
+		return previewComponent([theme.fg("muted", truncateToWidth(first, 120, "..."))], theme, context);
 	}
 
 	if (context.isError) {

@@ -187,6 +187,81 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	console.log("OK  bash renderer: live 3-line tail + elapsed/took timing");
 }
 
+// Result text is untrusted terminal input. Check raw rendered bytes (not just
+// visible text), across streaming, completed, expanded, error and generic paths.
+{
+	const controls = [
+		"\x1b[1A\x1b[2K", "\x1b[?25l\x1b[2J", "\x9b1A\x9b2K",
+		"\x1b]0;hidden-title\x07", "\x1b]52;c;hidden-clipboard\x1b\\",
+		"\x9d0;hidden-title\x9c", "\x1bP hidden-dcs\x1b\\",
+		"\x1b_hidden-apc\x1b\\", "\x1b^hidden-pm\x1b\\",
+		"\x1b7\x1b8\x1bM\x1bc\x1b(B", "\x00\x07\x08\x0b\x0c\x0e\x0f\x7f\x85",
+	];
+	const text = `\x1b[38;2;12;34;56mcolored\x1b[0m${controls.join("")} ordinary 中文\nlast line`;
+	const cases: Array<[string, Record<string, unknown>, ToolDefinition | undefined]> = [
+		["bash", { command: "test-output" }, fakePi.tools.get("bash")],
+		["read", { path: "test.txt" }, fakePi.tools.get("read")],
+		["mcp__demo__safe", {}, { name: "mcp__demo__safe", label: "safe", description: "test", parameters: {} }],
+	];
+	for (const [name, args, definition] of cases) {
+		for (const isError of [false, true]) {
+			const result = { content: [{ type: "text", text }], isError };
+			const original = JSON.stringify(result);
+			const component = toolComponent(name, args, result, definition);
+			for (const partial of [true, false]) {
+				component.updateResult(result as never, partial);
+				for (const expanded of [false, true]) {
+					component.setExpanded(expanded);
+					for (const renderWidth of [60, 120]) {
+						const output = component.render(renderWidth).join("\n");
+						const withoutStyles = output.replace(/\x1b\[[0-9;:]*m/g, "");
+						assert(!/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(withoutStyles), `${name}: active terminal control escaped into result display`);
+						assert(output.includes("\x1b[38;2;12;34;56m"), `${name}: result color was lost`);
+						assert(withoutStyles.includes("colored ordinary 中文"), `${name}: ordinary result text changed`);
+						assert(!withoutStyles.includes("hidden-"), `${name}: terminal string payload leaked`);
+					}
+				}
+			}
+			assert(JSON.stringify(result) === original, `${name}: rendering mutated original result`);
+		}
+	}
+	// Generic progress clipping must not split a safe SGR sequence into an
+	// unfinished escape (the old character-count clipping cut inside this one).
+	const generic = toolComponent("mcp__demo__safe", {}, { content: [] }, cases[2][2]);
+	generic.updateResult({ content: [{ type: "text", text: `${"x".repeat(115)}\x1b[38;2;12;34;56mcolored suffix\x1b[0m` }] } as never, true);
+	const progress = generic.render(200).join("\n");
+	assert(progress.includes("\x1b[38;2;12;34;56m"), "generic progress clipping split a result style");
+	assert(!/[\x1b\x7f-\x9f]/.test(plain([progress])), "generic progress clipping introduced an active escape");
+
+	for (const suffix of ["\x1b", "\x1b[", "\x1b[38;2;", "\x1b]52;c;hidden-payload", "\x1bP hidden-payload"]) {
+		const component = toolComponent("read", { path: "test.txt" }, {
+			content: [{ type: "text", text: `ordinary${suffix}` }],
+		});
+		for (const expanded of [false, true]) {
+			component.setExpanded(expanded);
+			const output = plain(component.render(width));
+			assert(output.includes("ordinary"), "unfinished control removed ordinary text");
+			assert(!/[\x1b\x7f-\x9f]/.test(output), "unfinished terminal control escaped");
+			assert(!output.includes("hidden-payload"), "unfinished string control payload leaked");
+		}
+	}
+	for (const name of ["write", "edit"]) {
+		for (const details of [{ diff: `+colored${controls.join("")}` }, { piCcTools: { renderedDiff: `+colored${controls.join("")}` } }]) {
+			const result = { content: [{ type: "text", text }], details };
+			const original = JSON.stringify(result);
+			const component = toolComponent(name, { path: "test.txt" }, result);
+			for (const expanded of [false, true]) {
+				component.setExpanded(expanded);
+				const output = plain(component.render(width));
+				assert(output.includes("+colored"), `${name}: diff content missing`);
+				assert(!/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(output), `${name}: active control in diff`);
+			}
+			assert(JSON.stringify(result) === original, `${name}: rendering mutated diff details`);
+		}
+	}
+	console.log("OK  result display: terminal controls removed, colors/text and original results preserved");
+}
+
 // Errors stay visible but are reduced to the first line when collapsed.
 {
 	const component = toolComponent("bash", { command: "false" }, {
