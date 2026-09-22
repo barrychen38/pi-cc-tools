@@ -862,7 +862,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	}
 }
 
-// ── Active thinking shows elapsed time without rendering its content ──
+// ── Active thinking uses static labels without rendering its content ──
 {
 	const historicalMessage = {
 		role: "assistant",
@@ -873,8 +873,10 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	};
 	const historical = new AssistantMessageComponent(historicalMessage as never, true);
 	const historicalRender = ensureArray(historical.render(width));
-	assert(plain(historicalRender).includes("Thought for 1.2s"), "historical duration label was missing");
-	assertTextStartsAtColumnZero(historicalRender, "Thought for 1.2s");
+	const historicalOutput = plain(historicalRender);
+	assert(historicalOutput.includes("Thought"), "historical static label was missing");
+	assert(!historicalOutput.includes("1.2s"), "historical duration remained visible");
+	assertTextStartsAtColumnZero(historicalRender, "Thought");
 
 	const currentMessageBase = {
 		role: "assistant",
@@ -915,22 +917,21 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 		: "\x1b[38;5;146m";
 	assert(activeRender.join("\n").includes(thinkingTextAnsi), "active thinking did not use Macchiato Subtext 0");
 	const activeOutput = plain(activeRender);
-	assert(activeOutput.includes("Thinking for "), "active thinking elapsed label was missing");
+	assert(activeOutput.includes("Thinking…"), "active static thinking label was missing");
+	assert(!/Thinking for |\d+(?:ms|\.\d+s)/.test(activeOutput), "active thinking duration remained visible");
 	assert(!activeOutput.includes("thought-line-12"), "active thinking content was visible");
-	assertTextStartsAtColumnZero(activeRender, "Thinking for ");
+	assertTextStartsAtColumnZero(activeRender, "Thinking…");
 
 	historical.invalidate();
 	const unchangedHistory = plain(ensureArray(historical.render(width)));
-	assert(unchangedHistory.includes("Thought for 1.2s"), "active thinking changed a historical label");
+	assert(unchangedHistory.includes("Thought"), "active thinking changed a historical label");
+	assert(!unchangedHistory.includes("1.2s"), "historical duration returned after invalidation");
 	assert(!unchangedHistory.includes("thought-line-12"), "current thinking leaked into history");
 
 	await new Promise((resolve) => setTimeout(resolve, 220));
 	current.updateContent(currentDeltaMessage as never);
 	const refreshedOutput = plain(ensureArray(current.render(width)));
-	assert(
-		/Thinking for (?:\d+ms|\d+\.\ds)/.test(refreshedOutput) && refreshedOutput !== activeOutput,
-		"active thinking elapsed label did not refresh",
-	);
+	assert(refreshedOutput === activeOutput, "active static thinking label changed over time");
 	assert(!refreshedOutput.includes("thought-line-12"), "refreshed thinking content was visible");
 
 	const thinkingEndMessage = {
@@ -948,9 +949,10 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const completedRender = ensureArray(current.render(width));
 	assert(completedRender.join("\n").includes(thinkingTextAnsi), "completed thinking label did not use Macchiato Subtext 0");
 	const completedOutput = plain(completedRender);
-	assert(completedOutput.includes("Thought for "), "completed thinking duration label was missing");
+	assert(completedOutput.includes("Thought"), "completed static thinking label was missing");
+	assert(!/Thought for |\d+(?:ms|\.\d+s)/.test(completedOutput), "completed thinking duration remained visible");
 	assert(!completedOutput.includes("thought-line-12"), "completed thinking content did not collapse");
-	assertTextStartsAtColumnZero(completedRender, "Thought for ");
+	assertTextStartsAtColumnZero(completedRender, "Thought");
 
 	const finalMessage = {
 		...currentMessageBase,
@@ -963,10 +965,11 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const reloaded = new AssistantMessageComponent(finalMessage as never, true);
 	const reloadedRender = ensureArray(reloaded.render(width));
 	const reloadedOutput = plain(reloadedRender);
-	assert(reloadedOutput.includes("Thought for "), "persisted thinking duration was not rendered");
+	assert(reloadedOutput.includes("Thought"), "reloaded static thinking label was missing");
+	assert(!/Thought for |\d+(?:ms|\.\d+s)/.test(reloadedOutput), "persisted thinking duration was rendered");
 	assert(!reloadedOutput.includes("thought-line-12"), "persisted thinking content was not collapsed");
-	assertTextStartsAtColumnZero(reloadedRender, "Thought for ");
-	console.log("OK  thinking: labels use full width, content stays hidden, history stays unchanged");
+	assertTextStartsAtColumnZero(reloadedRender, "Thought");
+	console.log("OK  thinking: static labels use full width, content stays hidden, history stays unchanged");
 }
 
 console.log("\nAll minimal-renderer checks passed.");

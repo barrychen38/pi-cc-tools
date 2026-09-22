@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Hidden thinking blocks now show static `Thinking…` / `Thought` labels without elapsed time; the original thinking content remains available through Pi's native click-to-expand interaction.
 - Referenced `$skill` instructions now use Pi's transcript-aware structured system-prompt sections, preserving prompt-cache prefixes on Pi 0.86 while retaining a fallback for older Pi versions.
 - Development and lockfile verification now target Pi 0.86.0.
 - `Agent` / subagent output now keeps its native status background in transparent/outline modes while all other tool shells remain transparent.

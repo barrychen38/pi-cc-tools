@@ -13,7 +13,7 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
 - MCP and unknown custom tools use the same unboxed compact fallback renderer and show the first partial progress line while running.
 - `Agent` / subagent tools keep their own registered renderers and native background; other tools remain transparent in non-default background modes.
-- Thinking content stays hidden; streaming updates show `Thinking for 1.2s`, then collapse to `Thought for 1.2s` in Catppuccin Macchiato Subtext 0 (`#a5adcb`).
+- Thinking content stays collapsed by default; streaming updates show `Thinking…`, then settle on `Thought` in Catppuccin Macchiato Subtext 0 (`#a5adcb`). Click the block to reveal the original thinking content.
 - Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row while retaining the native one-line gap above the editor.
 - Syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
@@ -55,4 +55,4 @@ npm run bench:tools -- baseline 120 12 8
 npm run bench:tools -- minimal 120 12 8
 ```
 
-The extension is verified against Pi 0.86.0 and preserves built-in tool metadata such as constrained sampling and argument preparation when installing compact renderers. Referenced `$skill` instructions use transcript-aware prompt sections on supported Pi versions. Small component-level fallbacks keep MCP/custom tool shells compact and replace thinking content with an elapsed-time label.
+The extension is verified against Pi 0.86.0 and preserves built-in tool metadata such as constrained sampling and argument preparation when installing compact renderers. Referenced `$skill` instructions use transcript-aware prompt sections on supported Pi versions. Small component-level fallbacks keep MCP/custom tool shells compact and replace collapsed thinking content with a static status label.

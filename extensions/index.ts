@@ -77,11 +77,6 @@ function thinkingMessageKey(message: Record<string, unknown>): string | undefine
 	return `${provider}:${model}:${timestamp}`;
 }
 
-function formatThinkDuration(ms: number): string {
-	if (ms < 1000) return `${ms}ms`;
-	return `${(ms / 1000).toFixed(1)}s`;
-}
-
 const THINKING_PATCH = Symbol.for("pi-cc-tools:thinking-patch");
 const ASSISTANT_CONTENT_PADDING_PATCH = Symbol.for("pi-cc-tools:assistant-content-padding");
 const SKILL_AUTOCOMPLETE_PATCH = Symbol.for("pi-cc-tools:skill-autocomplete");
@@ -312,16 +307,10 @@ function patchAssistantThinkingLabel(): void {
 		hiddenThinkingLabel?: string;
 	}, message: Record<string, unknown>) {
 		const state = thinkingStates.get(thinkingMessageKey(message) ?? "");
-		const activeDuration = state?.active ? Date.now() - state.startedAt : undefined;
-		const duration = message[THINK_DURATION_KEY] ?? state?.duration;
-		if (activeDuration !== undefined) {
-			this.hiddenThinkingLabel = `Thinking for ${formatThinkDuration(activeDuration)}`;
-		} else if (typeof duration === "number" && duration >= 0) {
-			this.hiddenThinkingLabel = `Thought for ${formatThinkDuration(duration)}`;
-		}
+		this.hiddenThinkingLabel = state?.active ? "Thinking…" : "Thought";
 
-		// Thinking content is intentionally kept collapsed. Streaming message
-		// updates refresh the elapsed label without adding a separate timer.
+		// Thinking content stays collapsed by default and can still be expanded
+		// through Pi's native thinking-block interaction.
 		this.hideThinkingBlock = true;
 		return original.call(this, message);
 	};
