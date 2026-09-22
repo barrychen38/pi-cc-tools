@@ -141,15 +141,15 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	});
 	const collapsed = plain(component.render(width));
 	assert(collapsed.includes("● Read src/index.ts"), "collapsed read call style changed");
-	assert(collapsed.includes("└─ line one"), "collapsed preview did not show head lines");
-	assert(collapsed.includes("line three"), "collapsed preview stopped before 3 lines");
+	assert(collapsed.includes("│ line one"), "collapsed preview did not show head lines");
+	assert(collapsed.includes("│ line one\n│ line two\n│ line three"), "collapsed preview stopped before 3 lines");
 	assert(!collapsed.includes("line four"), "collapsed preview exceeded 3 lines");
-	assert(collapsed.includes("… +4 lines (ctrl+o to expand)"), "collapsed preview missing truncation hint");
+	assert(collapsed.split("\n").includes("  … +4 lines (ctrl+o to expand)"), "collapsed preview missing truncation hint");
 
 	component.setExpanded(true);
 	const expanded = plain(component.render(width));
-	assert(expanded.includes("└─ line one"), "expanded result did not keep branch styling");
-	assert(expanded.includes("line seven"), "expanded result did not include tail lines");
+	assert(expanded.includes("│ line one"), "expanded result did not keep branch styling");
+	assert(expanded.split("\n").map((line) => line.trimEnd()).join("\n").includes("│ line six\n│ line seven"), "expanded result did not include tail lines");
 	console.log("OK  built-in renderer: collapsed 3-line preview + styled expanded result");
 }
 
@@ -179,11 +179,11 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 
 	assert(live.includes("○ Bash $ printf hello"), "pending call did not use pending status dot");
 	assert(/\(\d+\.\d+s\)/.test(live), "pending bash call did not show elapsed time");
-	assert(live.includes("└─ …"), "live bash preview did not mark hidden earlier output");
+	assert(live.split("\n").includes("  …"), "live bash preview did not mark hidden earlier output");
 	assert(live.includes("line five"), "live bash preview omitted the tail");
 	assert(!live.includes("line four"), "live bash preview exceeded 3 lines");
 	assert(narrow.every((line) => visibleWidth(line) <= 36), "live bash preview exceeded render width");
-	assert(/took \d+\.\d+s/.test(completed), "completed bash result did not retain duration");
+	assert(/^  took \d+\.\d+s$/m.test(completed), "completed bash result did not retain duration");
 	console.log("OK  bash renderer: live 3-line tail + elapsed/took timing");
 }
 
@@ -270,7 +270,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	});
 	const collapsed = plain(component.render(width));
 	assert(collapsed.includes("● Bash $ false"), "error call style changed");
-	assert(collapsed.includes("└─ command failed"), "collapsed error was hidden");
+	assert(collapsed.includes("│ command failed"), "collapsed error was hidden");
 	assert(!collapsed.includes("verbose diagnostic body"), "collapsed error was not reduced");
 	console.log("OK  error renderer: first-line error remains visible");
 }
@@ -301,10 +301,10 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 		content: [{ type: "text", text: "custom result\nsecond line\nthird line\nfourth line\nfifth line\nsixth line" }],
 	} as never, false);
 	const collapsed = plain(component.render(width));
-	assert(partial.includes("└─ Searching remote source..."), "generic custom partial progress was hidden");
+	assert(partial.includes("│ Searching remote source..."), "generic custom partial progress was hidden");
 	assert(!partial.includes("ignored detail"), "generic custom partial progress exceeded one line");
 	assert(collapsed.includes("● MCP needle"), "generic custom call renderer was not installed");
-	assert(collapsed.includes("└─ custom result"), "generic custom result did not show first-line summary");
+	assert(collapsed.includes("│ custom result"), "generic custom result did not show first-line summary");
 	assert(collapsed.includes("… +3 lines (ctrl+o to expand)"), "generic custom result missing truncation hint");
 	assert(!collapsed.includes("fourth line"), "generic custom result exceeded 3-line preview");
 	console.log("OK  generic renderer: MCP/custom tools show 3-line result preview");
@@ -651,7 +651,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 
 	function branchIndent(line: string): number | undefined {
 		const stripped = stripAnsi(line);
-		const idx = stripped.indexOf("└─");
+		const idx = stripped.indexOf("│");
 		return idx >= 0 ? idx : undefined;
 	}
 
@@ -670,7 +670,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 		callIndents.set(name, renderedCallIndent);
 
 		// Every tool result (collapsed) must have a branch block
-		const branchLine = lines.find((line) => stripAnsi(line).includes("└─"));
+		const branchLine = lines.find((line) => stripAnsi(line).includes("│"));
 		const renderedResultIndent = branchLine ? branchIndent(branchLine) : undefined;
 
 		// Error variant: must align with success variant

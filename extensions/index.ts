@@ -613,16 +613,15 @@ function bashState(context: RenderContext): BashRenderState {
 }
 
 function branchLines(content: string[], theme: Theme): string[] {
-	const rule = theme.fg("borderMuted", "└─");
-	const continuation = theme.fg("borderMuted", "│");
-	return content.map((line, index) => index === 0 ? `${rule} ${line}` : `${continuation}  ${line}`);
+	const rule = theme.fg("borderMuted", "│");
+	return content.map((line) => `${rule} ${line}`);
 }
 
-function previewComponent(content: string[], theme: Theme, context: RenderContext): Component {
+function previewComponent(lines: string[], context: RenderContext): Component {
 	const component = context.lastComponent instanceof WidthAwarePreview
 		? context.lastComponent
 		: new WidthAwarePreview();
-	component.setLines(branchLines(content, theme));
+	component.setLines(lines);
 	return component;
 }
 
@@ -637,36 +636,31 @@ function previewTextLines(result: TextResult): string[] {
 function collapsedPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
 	const allLines = previewTextLines(result);
 	if (allLines.length === 0) return undefined;
-	const lines = allLines
+	const lines = branchLines(allLines
 		.slice(0, COLLAPSED_PREVIEW_LINES)
-		.map((line) => theme.fg("muted", line));
+		.map((line) => theme.fg("muted", line)), theme);
 	if (allLines.length > COLLAPSED_PREVIEW_LINES) {
 		const hidden = allLines.length - COLLAPSED_PREVIEW_LINES;
-		lines.push(theme.fg("dim", `… +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)`));
+		lines.push(theme.fg("dim", `  … +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)`));
 	}
 
 	const state = context.state as BashRenderState | undefined;
 	if (state?.startedAt !== undefined && state.endedAt !== undefined) {
-		lines.push(theme.fg("dim", `took ${formatDuration(state.endedAt - state.startedAt)}`));
+		lines.push(theme.fg("dim", `  took ${formatDuration(state.endedAt - state.startedAt)}`));
 	}
-	return previewComponent(lines, theme, context);
+	return previewComponent(lines, context);
 }
 
 function liveTailPreview(result: TextResult, theme: Theme, context: RenderContext): Component | undefined {
 	const allLines = previewTextLines(result);
 	if (allLines.length === 0) return undefined;
-	const lines = allLines.length > COLLAPSED_PREVIEW_LINES ? [theme.fg("dim", "…")] : [];
-	lines.push(...allLines.slice(-COLLAPSED_PREVIEW_LINES).map((line) => theme.fg("muted", line)));
-	return previewComponent(lines, theme, context);
+	const lines = allLines.length > COLLAPSED_PREVIEW_LINES ? [theme.fg("dim", "  …")] : [];
+	lines.push(...branchLines(allLines.slice(-COLLAPSED_PREVIEW_LINES).map((line) => theme.fg("muted", line)), theme));
+	return previewComponent(lines, context);
 }
 
 function branchBlock(content: string, theme: Theme): string {
-	const rule = theme.fg("borderMuted", "└─");
-	const continuation = theme.fg("borderMuted", "│");
-	return content
-		.split("\n")
-		.map((line, index) => index === 0 ? `${rule} ${line}` : `${continuation}  ${line}`)
-		.join("\n");
+	return branchLines(content.split("\n"), theme).join("\n");
 }
 
 function renderMinimalResult(
@@ -1124,7 +1118,7 @@ function renderGenericResult(
 	if (context.isPartial) {
 		const first = firstTextLine(result);
 		if (!first || first === "Tool failed") return emptyText();
-		return previewComponent([theme.fg("muted", truncateToWidth(first, 120, "..."))], theme, context);
+		return previewComponent(branchLines([theme.fg("muted", truncateToWidth(first, 120, "..."))], theme), context);
 	}
 
 	if (context.isError) {
