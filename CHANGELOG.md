@@ -12,7 +12,8 @@
 
 ### Changed
 
-- Thinking previews now wrap before taking the latest 3 visual lines, use tool-matching gray connectors, and retain a completed first-three-line preview with hidden-line count and duration. Native click and `Ctrl+O` expansion are supported; streaming flags pass through component wrappers.
+- Thinking labels remain `Thinking` during and after streaming. Thinking duration is no longer measured, persisted, or displayed; tool execution timing is unchanged.
+- Thinking previews now wrap before taking the latest 3 visual lines, use tool-matching gray connectors, and retain a completed first-three-line preview with hidden-line count. Native click and `Ctrl+O` expansion are supported; streaming flags pass through component wrappers.
 - Referenced `$skill` instructions now use Pi's transcript-aware structured system-prompt sections, preserving prompt-cache prefixes on Pi 0.86 while retaining a fallback for older Pi versions.
 - Development and lockfile verification now target Pi 0.86.0.
 - `Agent` / subagent output now keeps its native status background in transparent/outline modes while all other tool shells remain transparent.

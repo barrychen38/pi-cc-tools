@@ -13,7 +13,7 @@ Compact Pi tool rendering with the existing Claude-style colors, labels, status 
 - `Ctrl+O` can still expand a tool result; expanded output is plain text and capped at `expandedPreviewMaxLines`.
 - MCP and unknown custom tools use the same unboxed compact fallback renderer and show the first partial progress line while running.
 - `Agent` / subagent tools keep their own registered renderers and native background; other tools remain transparent in non-default background modes.
-- Collapsed thinking wraps to terminal width and shows the latest 3 non-empty visual lines while streaming, using the same gray connectors as tools. Completed thoughts show the first 3 lines, `… +N lines (ctrl+o to expand)`, and `took Ns` when timing is available. Thinking starts collapsed; click or `Ctrl+O` to expand, or use Pi’s native thinking visibility toggle.
+- Thinking always uses the `Thinking` label without timing. Collapsed thinking wraps to terminal width and shows the latest 3 non-empty visual lines while streaming, using the same gray connectors as tools. Completed thoughts show the first 3 lines and `… +N lines (ctrl+o to expand)` when more lines are hidden. Thinking starts collapsed; click or `Ctrl+O` to expand, or use Pi’s native thinking visibility toggle.
 - Pi's native working indicator remains visible while the agent is streaming or running a long tool, then removes its row while retaining the native one-line gap above the editor.
 - Syntax highlighting, grouping, turn-time text, and custom spinners are disabled.
 - Tool execution is delegated to Pi's built-in tools without changing their behavior.
@@ -57,4 +57,4 @@ npm run bench:tools -- baseline 120 12 8
 npm run bench:tools -- minimal 120 12 8
 ```
 
-The extension is verified against Pi 0.86.0 and preserves built-in tool metadata such as constrained sampling and argument preparation when installing compact renderers. Referenced `$skill` instructions use transcript-aware prompt sections on supported Pi versions. Small component-level fallbacks keep MCP/custom tool shells compact and show a bounded live thinking preview before retaining a compact summary and duration.
+The extension is verified against Pi 0.86.0 and preserves built-in tool metadata such as constrained sampling and argument preparation when installing compact renderers. Referenced `$skill` instructions use transcript-aware prompt sections on supported Pi versions. Small component-level fallbacks keep MCP/custom tool shells compact and show a bounded live thinking preview before retaining a compact summary without timing.

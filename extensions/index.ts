@@ -67,8 +67,7 @@ const THINKING_TEXT_256COLOR = "\x1b[38;5;146m";
 const GENERIC_RENDERER_PATCH = Symbol.for("pi-cc-tools:minimal-renderer");
 const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer");
 
-const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
-type ThinkingState = { active: boolean; startedAt: number; duration?: number };
+type ThinkingState = { active: boolean };
 type ThinkingRuntime = { states: Map<string, ThinkingState>; theme?: Theme };
 const THINKING_RUNTIME = Symbol.for("pi-cc-tools:thinking-runtime");
 // Prototype patches outlive an extension module on /reload. Their state must
@@ -323,7 +322,7 @@ function patchAssistantThinkingLabel(): void {
 		contentContainer?: { children: Component[] };
 	}, message: Record<string, unknown>, ...rest: unknown[]) {
 		const state = thinkingStates.get(thinkingMessageKey(message) ?? "");
-		this.hiddenThinkingLabel = state?.active ? "Thinking…" : "Thought";
+		this.hiddenThinkingLabel = "Thinking";
 		if (!initialized.has(this)) {
 			this.hideThinkingBlock = true;
 			initialized.add(this);
@@ -346,17 +345,13 @@ function patchAssistantThinkingLabel(): void {
 		}
 		const visibleRuns = runs.filter((run) => run.length > 0);
 		const regions = this.contentContainer?.children.filter((child) => "child" in child && "onMouse" in child) ?? [];
-		const duration = state?.duration ?? message[THINK_DURATION_KEY];
 		for (const [index, run] of visibleRuns.entries()) {
 			const region = regions[index] as { child: Component } | undefined;
 			const hidden = region?.child as { text?: unknown } | undefined;
 			// Pi can load a separate pi-tui copy; don't rely on instanceof.
 			if (!region || typeof hidden?.text !== "string" || stripTerminalSequences(hidden.text) !== this.hiddenThinkingLabel) continue;
 			const active = !!state?.active && index === visibleRuns.length - 1;
-			region.child = new ThinkingPreview(
-				run.join("\n\n"), active,
-				index === visibleRuns.length - 1 && typeof duration === "number" ? duration : undefined,
-			);
+			region.child = new ThinkingPreview(run.join("\n\n"), active);
 		}
 		return result;
 	};
@@ -656,7 +651,7 @@ class ThinkingPreview implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(text: string, private active: boolean, private duration?: number) {
+	constructor(text: string, private active: boolean) {
 		this.text = stripTerminalSequences(safeResultText(text))
 			.replace(/\t/g, "   ")
 			.replace(/\*\*([^\n]+?)\*\*/g, "$1");
@@ -667,14 +662,13 @@ class ThinkingPreview implements Component {
 		const theme = thinkingRuntime.theme!;
 		const lines = wrapTextWithAnsi(this.text, Math.max(1, width - 2)).filter((line) => line.trim());
 		const content = this.active ? lines.slice(-COLLAPSED_PREVIEW_LINES) : lines.slice(0, COLLAPSED_PREVIEW_LINES);
-		const output = [theme.italic(theme.fg("thinkingText", this.active ? "Thinking…" : "Thought"))];
+		const output = [theme.italic(theme.fg("thinkingText", "Thinking"))];
 		if (this.active && lines.length > COLLAPSED_PREVIEW_LINES) output.push(theme.fg("dim", "  …"));
 		output.push(...branchLines(content.map((line) => theme.fg("muted", line)), theme));
 		if (!this.active) {
 			const hidden = lines.length - content.length;
 			const summary = hidden > 0 ? `… +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)` : "";
-			const duration = this.duration === undefined ? "" : `took ${formatDuration(this.duration)}`;
-			if (summary || duration) output.push(theme.fg("dim", `  ${[summary, duration].filter(Boolean).join(" ")}`));
+			if (summary) output.push(theme.fg("dim", `  ${summary}`));
 		}
 		this.cachedWidth = width;
 		this.cachedLines = output.map((line) => truncateToWidth(line, width, "…"));
@@ -1548,13 +1542,11 @@ export default function (pi: ExtensionAPI): void {
 		if (!key) return;
 
 		if (evt.type === "thinking_start") {
-			thinkingStates.set(key, { active: true, startedAt: Date.now() });
+			thinkingStates.set(key, { active: true });
 		} else if (evt.type === "thinking_end") {
 			const state = thinkingStates.get(key);
 			if (!state?.active) return;
 			state.active = false;
-			state.duration = Date.now() - state.startedAt;
-			msg[THINK_DURATION_KEY] = state.duration;
 		}
 	});
 
@@ -1564,14 +1556,6 @@ export default function (pi: ExtensionAPI): void {
 		const key = thinkingMessageKey(msg as Record<string, unknown>);
 		if (!key) return;
 
-		const state = thinkingStates.get(key);
-		if (state?.active) {
-			state.duration = Date.now() - state.startedAt;
-			state.active = false;
-		}
-		if (state?.duration !== undefined) {
-			msg[THINK_DURATION_KEY] = state.duration;
-		}
 		thinkingStates.delete(key);
 	});
 }

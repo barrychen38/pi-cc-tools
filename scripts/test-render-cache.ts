@@ -139,17 +139,17 @@ for (const reload of [1, 2]) {
 	}
 	const component = new AssistantMessageComponent(message as never, true);
 	const active = plain(ensureArray(component.render(width)));
-	assert(active.includes("Thinking…") && active.includes("six"), `fresh module lost active thinking: ${active}`);
+	assert(active.includes("Thinking") && active.includes("six"), `fresh module lost active thinking: ${active}`);
 	for (const handler of reloadedPi.events.get("message_update") ?? []) {
 		await handler({ message, assistantMessageEvent: { type: "thinking_end" } }, context);
 	}
 	component.updateContent(message as never);
 	const done = plain(ensureArray(component.render(width)));
-	assert(done.includes("… +3 lines (ctrl+o to expand)") && /took \d+\.\d+s/.test(done), "reload lost completed summary");
+	assert(done.includes("… +3 lines (ctrl+o to expand)") && !done.includes("took "), "reload lost completed summary");
 	assert(done.includes("│ one") && !done.includes("**"), "completed thinking exposed Markdown bold markers");
 	for (const handler of reloadedPi.events.get("message_end") ?? []) await handler({ message }, context);
 	component.updateContent(message as never);
-	assert(/took \d+\.\d+s/.test(plain(ensureArray(component.render(width)))), "reload lost persisted duration on message_end");
+	assert(!plain(ensureArray(component.render(width))).includes("took "), "reload displayed thinking duration");
 	console.log(`OK  thinking: fresh module reload ${reload} keeps live state, theme and completed summary`);
 }
 
@@ -974,7 +974,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	}
 }
 
-// ── Thinking wraps into a live tail, then retains a compact summary and timing ──
+// ── Thinking keeps one label, a live tail and compact summary, without timing ──
 {
 	const historicalMessage = {
 		role: "assistant",
@@ -986,9 +986,9 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const historical = new AssistantMessageComponent(historicalMessage as never, true);
 	const historicalRender = ensureArray(historical.render(width));
 	const historicalOutput = plain(historicalRender);
-	assert(historicalOutput.includes("Thought"), "historical static label was missing");
-	assert(historicalOutput.includes("took 1.2s"), "historical duration missing");
-	assertTextStartsAtColumnZero(historicalRender, "Thought");
+	assert(historicalOutput.includes("Thinking"), "historical static label was missing");
+	assert(!historicalOutput.includes("took "), "historical duration remained visible");
+	assertTextStartsAtColumnZero(historicalRender, "Thinking");
 
 	const currentMessageBase = {
 		role: "assistant",
@@ -1029,7 +1029,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 		: "\x1b[38;5;146m";
 	assert(activeRender.join("\n").includes(thinkingTextAnsi), "active thinking did not use Macchiato Subtext 0");
 	const activeOutput = plain(activeRender);
-	assert(activeOutput.includes("Thinking…"), "active static thinking label was missing");
+	assert(activeOutput.includes("Thinking") && !activeOutput.includes("Thinking…"), "active thinking label was not stable");
 	assert(!/Thinking for |\d+(?:ms|\.\d+s)/.test(activeOutput), "active thinking duration remained visible");
 	assert(activeOutput.includes("thought-line-12"), "active thinking omitted the newest line");
 	assert(activeOutput.includes("thought-line-10"), "active thinking omitted one of the last three lines");
@@ -1037,11 +1037,11 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	assert(activeOutput.split("\n").includes("  …"), "active thinking omitted the older-content marker");
 	assert(activeOutput.split("\n").filter((line) => line.includes("thought-line-")).length === 3, "active thinking tail was not three lines");
 	assert(ensureArray(current.render(20)).every((line) => visibleWidth(line) <= 20), "active thinking exceeded narrow width");
-	assertTextStartsAtColumnZero(activeRender, "Thinking…");
+	assertTextStartsAtColumnZero(activeRender, "Thinking");
 
 	historical.invalidate();
 	const unchangedHistory = plain(ensureArray(historical.render(width)));
-	assert(unchangedHistory.includes("Thought"), "active thinking changed a historical label");
+	assert(unchangedHistory.includes("Thinking"), "active thinking changed a historical label");
 
 	assert(!unchangedHistory.includes("thought-line-12"), "current thinking leaked into history");
 
@@ -1121,11 +1121,11 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const completedRender = ensureArray(current.render(width));
 	assert(completedRender.join("\n").includes(thinkingTextAnsi), "completed thinking label did not use Macchiato Subtext 0");
 	const completedOutput = plain(completedRender);
-	assert(completedOutput.includes("Thought"), "completed static thinking label was missing");
-	assert(/took \d+\.\d+s/.test(completedOutput), "completed thinking duration missing");
+	assert(completedOutput.includes("Thinking"), "completed static thinking label was missing");
+	assert(!completedOutput.includes("took ") && !completedOutput.includes("Thought"), "completed thinking label or timing changed");
 	assert(completedOutput.includes("… +9 lines (ctrl+o to expand)"), "completed thinking summary missing");
 	assert(!completedOutput.includes("thought-line-12"), "completed thinking content did not collapse");
-	assertTextStartsAtColumnZero(completedRender, "Thought");
+	assertTextStartsAtColumnZero(completedRender, "Thinking");
 	const expansionHost = {
 		toolOutputExpanded: false,
 		loadedResourcesContainer: new Container(),
@@ -1148,15 +1148,15 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	for (const handler of fakePi.events.get("message_end") ?? []) {
 		await handler({ type: "message_end", message: finalMessage }, {});
 	}
-	assert(typeof (finalMessage as { _piCcToolsThinkDurationMs?: unknown })._piCcToolsThinkDurationMs === "number", "thinking duration was not persisted to the final message");
+	assert(!("_piCcToolsThinkDurationMs" in finalMessage), "thinking duration was still persisted");
 	const reloaded = new AssistantMessageComponent(finalMessage as never, true);
 	const reloadedRender = ensureArray(reloaded.render(width));
 	const reloadedOutput = plain(reloadedRender);
-	assert(reloadedOutput.includes("Thought"), "reloaded static thinking label was missing");
-	assert(/took \d+\.\d+s/.test(reloadedOutput), "persisted thinking duration missing");
+	assert(reloadedOutput.includes("Thinking"), "reloaded static thinking label was missing");
+	assert(!reloadedOutput.includes("took "), "persisted thinking duration remained visible");
 	assert(!reloadedOutput.includes("thought-line-12"), "persisted thinking content was not collapsed");
-	assertTextStartsAtColumnZero(reloadedRender, "Thought");
-	console.log("OK  thinking: visual-line tail, shared connector colors, Ctrl+O, summary/duration, history");
+	assertTextStartsAtColumnZero(reloadedRender, "Thinking");
+	console.log("OK  thinking: visual-line tail, shared connector colors, Ctrl+O, stable label, no timing, history");
 }
 
 
