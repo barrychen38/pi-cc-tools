@@ -21,7 +21,9 @@ import {
 	Editor,
 	Spacer,
 	Text,
+	stripTerminalSequences,
 	truncateToWidth,
+	wrapTextWithAnsi,
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type AutocompleteSuggestions,
@@ -67,7 +69,15 @@ const FIRST_MESSAGE_SPACER_PATCH = Symbol.for("pi-cc-tools:first-message-spacer"
 
 const THINK_DURATION_KEY = "_piCcToolsThinkDurationMs";
 type ThinkingState = { active: boolean; startedAt: number; duration?: number };
-const thinkingStates = new Map<string, ThinkingState>();
+type ThinkingRuntime = { states: Map<string, ThinkingState>; theme?: Theme };
+const THINKING_RUNTIME = Symbol.for("pi-cc-tools:thinking-runtime");
+// Prototype patches outlive an extension module on /reload. Their state must
+// live on the same prototype, not in a fresh module-local map/theme closure.
+const assistantPrototype = AssistantMessageComponent.prototype as unknown as Record<PropertyKey, unknown>;
+const thinkingRuntime = (assistantPrototype[THINKING_RUNTIME] ??= {
+	states: new Map<string, ThinkingState>(),
+}) as ThinkingRuntime;
+const thinkingStates = thinkingRuntime.states;
 
 function thinkingMessageKey(message: Record<string, unknown>): string | undefined {
 	const timestamp = message.timestamp;
@@ -302,17 +312,53 @@ function patchAssistantThinkingLabel(): void {
 	const original = proto.updateContent as (message: Record<string, unknown>) => void | undefined;
 	if (typeof original !== "function") return;
 
+	const initialized = new WeakSet<object>();
+	// Ctrl+O uses Pi's expandable-component contract, as tool results do.
+	proto.setExpanded = function (this: { setHideThinkingBlock: (hidden: boolean) => void }, expanded: boolean) {
+		this.setHideThinkingBlock(!expanded);
+	};
 	proto.updateContent = function patchedUpdateContent(this: {
 		hideThinkingBlock?: boolean;
 		hiddenThinkingLabel?: string;
-	}, message: Record<string, unknown>) {
+		contentContainer?: { children: Component[] };
+	}, message: Record<string, unknown>, ...rest: unknown[]) {
 		const state = thinkingStates.get(thinkingMessageKey(message) ?? "");
 		this.hiddenThinkingLabel = state?.active ? "Thinking…" : "Thought";
+		if (!initialized.has(this)) {
+			this.hideThinkingBlock = true;
+			initialized.add(this);
+		}
+		const result = Reflect.apply(original, this, [message, ...rest]);
+		if (!thinkingRuntime.theme || !Array.isArray(message.content)) return result;
 
-		// Thinking content stays collapsed by default and can still be expanded
-		// through Pi's native thinking-block interaction.
-		this.hideThinkingBlock = true;
-		return original.call(this, message);
+		const runs: string[][] = [];
+		let lastWasThinking = false;
+		for (const block of message.content) {
+			if (typeof block !== "object" || block === null || !("type" in block) || block.type !== "thinking") {
+				lastWasThinking = false;
+				continue;
+			}
+			if (!lastWasThinking) runs.push([]);
+			lastWasThinking = true;
+			if ("thinking" in block && typeof block.thinking === "string" && block.thinking.trim()) {
+				runs.at(-1)?.push(block.thinking.trim());
+			}
+		}
+		const visibleRuns = runs.filter((run) => run.length > 0);
+		const regions = this.contentContainer?.children.filter((child) => "child" in child && "onMouse" in child) ?? [];
+		const duration = state?.duration ?? message[THINK_DURATION_KEY];
+		for (const [index, run] of visibleRuns.entries()) {
+			const region = regions[index] as { child: Component } | undefined;
+			const hidden = region?.child as { text?: unknown } | undefined;
+			// Pi can load a separate pi-tui copy; don't rely on instanceof.
+			if (!region || typeof hidden?.text !== "string" || stripTerminalSequences(hidden.text) !== this.hiddenThinkingLabel) continue;
+			const active = !!state?.active && index === visibleRuns.length - 1;
+			region.child = new ThinkingPreview(
+				run.join("\n\n"), active,
+				index === visibleRuns.length - 1 && typeof duration === "number" ? duration : undefined,
+			);
+		}
+		return result;
 	};
 	proto[THINKING_PATCH] = true;
 }
@@ -326,11 +372,11 @@ function patchAssistantContentPadding(): void {
 
 	proto.updateContent = function patchedAssistantContentPadding(this: {
 		outputPad?: number;
-	}, message: Record<string, unknown>) {
+	}, message: Record<string, unknown>, ...rest: unknown[]) {
 		// Pi 0.86 wraps thinking blocks in MouseRegion, so clearing padding on
 		// direct children no longer reaches every rendered content component.
 		this.outputPad = 0;
-		return original.call(this, message);
+		return Reflect.apply(original, this, [message, ...rest]);
 	};
 	proto[ASSISTANT_CONTENT_PADDING_PATCH] = true;
 }
@@ -414,6 +460,7 @@ function usesTransparentToolShell(cwd: unknown): boolean {
 
 function configureMinimalUi(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
+	thinkingRuntime.theme = ctx.ui.theme;
 	applyThinkingTextColor(ctx.ui.theme);
 	ctx.ui.setWorkingIndicator();
 	ctx.ui.setWorkingMessage();
@@ -594,6 +641,43 @@ class WidthAwarePreview implements Component {
 			this.cachedWidth = width;
 			this.cachedLines = this.sourceLines.map((line) => truncateToWidth(line, width, "…"));
 		}
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+}
+
+// Wrap before taking the tail: thinking commonly streams as one long paragraph.
+class ThinkingPreview implements Component {
+	private text: string;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
+	constructor(text: string, private active: boolean, private duration?: number) {
+		this.text = stripTerminalSequences(safeResultText(text))
+			.replace(/\t/g, "   ")
+			.replace(/\*\*([^\n]+?)\*\*/g, "$1");
+	}
+
+	render(width: number): string[] {
+		if (this.cachedWidth === width && this.cachedLines) return this.cachedLines;
+		const theme = thinkingRuntime.theme!;
+		const lines = wrapTextWithAnsi(this.text, Math.max(1, width - 2)).filter((line) => line.trim());
+		const content = this.active ? lines.slice(-COLLAPSED_PREVIEW_LINES) : lines.slice(0, COLLAPSED_PREVIEW_LINES);
+		const output = [theme.italic(theme.fg("thinkingText", this.active ? "Thinking…" : "Thought"))];
+		if (this.active && lines.length > COLLAPSED_PREVIEW_LINES) output.push(theme.fg("dim", "  …"));
+		output.push(...branchLines(content.map((line) => theme.fg("muted", line)), theme));
+		if (!this.active) {
+			const hidden = lines.length - content.length;
+			const summary = hidden > 0 ? `… +${hidden} line${hidden === 1 ? "" : "s"} (ctrl+o to expand)` : "";
+			const duration = this.duration === undefined ? "" : `took ${formatDuration(this.duration)}`;
+			if (summary || duration) output.push(theme.fg("dim", `  ${[summary, duration].filter(Boolean).join(" ")}`));
+		}
+		this.cachedWidth = width;
+		this.cachedLines = output.map((line) => truncateToWidth(line, width, "…"));
 		return this.cachedLines;
 	}
 
@@ -1481,6 +1565,10 @@ export default function (pi: ExtensionAPI): void {
 		if (!key) return;
 
 		const state = thinkingStates.get(key);
+		if (state?.active) {
+			state.duration = Date.now() - state.startedAt;
+			state.active = false;
+		}
 		if (state?.duration !== undefined) {
 			msg[THINK_DURATION_KEY] = state.duration;
 		}

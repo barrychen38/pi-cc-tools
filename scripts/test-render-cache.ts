@@ -117,6 +117,43 @@ function toolComponent(
 	return component;
 }
 
+// A real /reload evaluates a NEW module, not just its default export again.
+for (const reload of [1, 2]) {
+	const wrapper = AssistantMessageComponent.prototype.updateContent;
+	const fresh = await import(`../extensions/index.ts?thinking-reload-test=${reload}`);
+	assert(fresh.default !== extension.default, "reload test reused the original module");
+	const reloadedPi = new FakePi();
+	fresh.default(reloadedPi as never);
+	assert(AssistantMessageComponent.prototype.updateContent === wrapper, "reload stacked thinking wrappers");
+	const context = {
+		hasUI: true, cwd,
+		ui: { theme, setWorkingIndicator() {}, setWorkingMessage() {}, setWorkingVisible() {} },
+	};
+	for (const handler of reloadedPi.events.get("agent_start") ?? []) await handler({}, context);
+	const message = {
+		role: "assistant", timestamp: 98765, provider: "test", model: "test", stopReason: "stop",
+		content: [{ type: "thinking", thinking: "**one**\ntwo\nthree\nfour\nfive\nsix" }],
+	};
+	for (const handler of reloadedPi.events.get("message_update") ?? []) {
+		await handler({ message, assistantMessageEvent: { type: "thinking_start" } }, context);
+	}
+	const component = new AssistantMessageComponent(message as never, true);
+	const active = plain(ensureArray(component.render(width)));
+	assert(active.includes("Thinking…") && active.includes("six"), `fresh module lost active thinking: ${active}`);
+	for (const handler of reloadedPi.events.get("message_update") ?? []) {
+		await handler({ message, assistantMessageEvent: { type: "thinking_end" } }, context);
+	}
+	component.updateContent(message as never);
+	const done = plain(ensureArray(component.render(width)));
+	assert(done.includes("… +3 lines (ctrl+o to expand)") && /took \d+\.\d+s/.test(done), "reload lost completed summary");
+	assert(done.includes("│ one") && !done.includes("**"), "completed thinking exposed Markdown bold markers");
+	for (const handler of reloadedPi.events.get("message_end") ?? []) await handler({ message }, context);
+	component.updateContent(message as never);
+	assert(/took \d+\.\d+s/.test(plain(ensureArray(component.render(width)))), "reload lost persisted duration on message_end");
+	console.log(`OK  thinking: fresh module reload ${reload} keeps live state, theme and completed summary`);
+}
+
+
 // The extension only replaces the seven built-in display adapters.
 for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 	assert(fakePi.tools.has(name), `missing built-in override: ${name}`);
@@ -937,7 +974,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	}
 }
 
-// ── Active thinking uses static labels without rendering its content ──
+// ── Thinking wraps into a live tail, then retains a compact summary and timing ──
 {
 	const historicalMessage = {
 		role: "assistant",
@@ -950,7 +987,7 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const historicalRender = ensureArray(historical.render(width));
 	const historicalOutput = plain(historicalRender);
 	assert(historicalOutput.includes("Thought"), "historical static label was missing");
-	assert(!historicalOutput.includes("1.2s"), "historical duration remained visible");
+	assert(historicalOutput.includes("took 1.2s"), "historical duration missing");
 	assertTextStartsAtColumnZero(historicalRender, "Thought");
 
 	const currentMessageBase = {
@@ -994,20 +1031,80 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const activeOutput = plain(activeRender);
 	assert(activeOutput.includes("Thinking…"), "active static thinking label was missing");
 	assert(!/Thinking for |\d+(?:ms|\.\d+s)/.test(activeOutput), "active thinking duration remained visible");
-	assert(!activeOutput.includes("thought-line-12"), "active thinking content was visible");
+	assert(activeOutput.includes("thought-line-12"), "active thinking omitted the newest line");
+	assert(activeOutput.includes("thought-line-10"), "active thinking omitted one of the last three lines");
+	assert(!activeOutput.includes("thought-line-09"), "active thinking exceeded three preview lines");
+	assert(activeOutput.split("\n").includes("  …"), "active thinking omitted the older-content marker");
+	assert(activeOutput.split("\n").filter((line) => line.includes("thought-line-")).length === 3, "active thinking tail was not three lines");
+	assert(ensureArray(current.render(20)).every((line) => visibleWidth(line) <= 20), "active thinking exceeded narrow width");
 	assertTextStartsAtColumnZero(activeRender, "Thinking…");
 
 	historical.invalidate();
 	const unchangedHistory = plain(ensureArray(historical.render(width)));
 	assert(unchangedHistory.includes("Thought"), "active thinking changed a historical label");
-	assert(!unchangedHistory.includes("1.2s"), "historical duration returned after invalidation");
+
 	assert(!unchangedHistory.includes("thought-line-12"), "current thinking leaked into history");
 
 	await new Promise((resolve) => setTimeout(resolve, 220));
 	current.updateContent(currentDeltaMessage as never);
 	const refreshedOutput = plain(ensureArray(current.render(width)));
-	assert(refreshedOutput === activeOutput, "active static thinking label changed over time");
-	assert(!refreshedOutput.includes("thought-line-12"), "refreshed thinking content was visible");
+	assert(refreshedOutput === activeOutput, "active thinking preview changed without new content");
+	const nextDeltaMessage = {
+		...currentMessageBase,
+		content: [{ type: "thinking", thinking: `${currentDeltaMessage.content[0].thinking}\nthought-line-13` }],
+	};
+	current.updateContent(nextDeltaMessage as never);
+	const nextOutput = plain(ensureArray(current.render(width)));
+	assert(nextOutput.includes("thought-line-13") && !nextOutput.includes("thought-line-10"), "active thinking tail did not advance");
+	const thinkingRegion = (current as unknown as { contentContainer: Container }).contentContainer.children.find((child) => "onMouse" in child) as { handleMouse: (event: unknown) => unknown };
+	assert(thinkingRegion, "native thinking mouse region was removed");
+	thinkingRegion.handleMouse({ type: "click", button: "left" });
+	const expandedOutput = plain(ensureArray(current.render(width)));
+	assert(expandedOutput.includes("thought-line-01"), "native click did not reveal full thinking");
+	const expandedRegion = (current as unknown as { contentContainer: Container }).contentContainer.children.find((child) => "onMouse" in child) as { handleMouse: (event: unknown) => unknown };
+	expandedRegion.handleMouse({ type: "click", button: "left" });
+	assert(!plain(ensureArray(current.render(width))).includes("thought-line-01"), "native click did not collapse thinking");
+
+	const headingMessage = {
+		...currentMessageBase,
+		content: [{ type: "thinking", thinking: "**Checking diff formatting**" }],
+	};
+	current.updateContent(headingMessage as never);
+	const headingOutput = plain(ensureArray(current.render(width)));
+	assert(headingOutput.includes("│ Checking diff formatting"), "thinking heading was not plain text");
+	assert(!headingOutput.includes("**"), "thinking preview exposed Markdown bold markers");
+	assert(headingMessage.content[0].thinking === "**Checking diff formatting**", "preview mutated original thinking");
+
+	const safeMessage = {
+		...currentMessageBase,
+		content: [{ type: "thinking", thinking: "old\nwide 汉字🙂 text with a long trailing segment\n\u001b[2Jlatest" }],
+	};
+	current.updateContent(safeMessage as never);
+	const safeRender = ensureArray(current.render(16));
+	const safeOutput = plain(safeRender);
+	assert(safeOutput.includes("latest"), "short thinking preview was incorrect");
+	assert(!safeRender.join("").includes("\u001b[2J"), "thinking preview preserved terminal controls");
+	assert(safeRender.every((line) => visibleWidth(line) <= 16), "wide thinking preview exceeded narrow width");
+
+	const paragraphMessage = {
+		...currentMessageBase,
+		content: [{ type: "thinking", thinking: "word ".repeat(80) + "NEWEST" }],
+	};
+	current.updateContent(paragraphMessage as never, true);
+	assert((current as unknown as { isStreaming: boolean }).isStreaming, "streaming flag was dropped by wrapper");
+	const paragraphLines = ensureArray(current.render(36));
+	assert(plain(paragraphLines).includes("NEWEST"), "long paragraph hid the latest streaming text");
+	assert(paragraphLines.filter((line) => line.includes("│")).length === 3, "paragraph did not fill three visual lines");
+	assert(paragraphLines.some((line) => line.includes(theme.fg("borderMuted", "│"))), "thinking connector differs from tool connector");
+	paragraphMessage.content[0].thinking += " " + "more ".repeat(40) + "UPDATED";
+	for (const handler of fakePi.events.get("message_update") ?? []) {
+		await handler({ message: paragraphMessage, assistantMessageEvent: { type: "thinking_delta" } }, {});
+	}
+	current.updateContent(paragraphMessage as never, true);
+	const updatedParagraph = plain(ensureArray(current.render(36)));
+	assert(updatedParagraph.includes("UPDATED") && !updatedParagraph.includes("NEWEST"), "paragraph tail failed to roll on delta");
+	assert(ensureArray(current.render(1)).every((line) => visibleWidth(line) <= 1), "tiny viewport exceeded width");
+
 
 	const thinkingEndMessage = {
 		...currentMessageBase,
@@ -1025,9 +1122,24 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	assert(completedRender.join("\n").includes(thinkingTextAnsi), "completed thinking label did not use Macchiato Subtext 0");
 	const completedOutput = plain(completedRender);
 	assert(completedOutput.includes("Thought"), "completed static thinking label was missing");
-	assert(!/Thought for |\d+(?:ms|\.\d+s)/.test(completedOutput), "completed thinking duration remained visible");
+	assert(/took \d+\.\d+s/.test(completedOutput), "completed thinking duration missing");
+	assert(completedOutput.includes("… +9 lines (ctrl+o to expand)"), "completed thinking summary missing");
 	assert(!completedOutput.includes("thought-line-12"), "completed thinking content did not collapse");
 	assertTextStartsAtColumnZero(completedRender, "Thought");
+	const expansionHost = {
+		toolOutputExpanded: false,
+		loadedResourcesContainer: new Container(),
+		chatContainer: { children: [current] },
+		showStatus() {},
+	};
+	const setToolsExpanded = (InteractiveMode.prototype as unknown as {
+		setToolsExpanded: (expanded: boolean) => void;
+	}).setToolsExpanded;
+	setToolsExpanded.call(expansionHost, true);
+	assert(plain(ensureArray(current.render(width))).includes("thought-line-12"), "Ctrl+O did not expand thinking");
+	setToolsExpanded.call(expansionHost, false);
+	assert(plain(ensureArray(current.render(width))).includes("ctrl+o to expand"), "Ctrl+O did not restore thinking summary");
+
 
 	const finalMessage = {
 		...currentMessageBase,
@@ -1041,10 +1153,11 @@ console.log("OK  built-in metadata: constrained sampling and compatibility field
 	const reloadedRender = ensureArray(reloaded.render(width));
 	const reloadedOutput = plain(reloadedRender);
 	assert(reloadedOutput.includes("Thought"), "reloaded static thinking label was missing");
-	assert(!/Thought for |\d+(?:ms|\.\d+s)/.test(reloadedOutput), "persisted thinking duration was rendered");
+	assert(/took \d+\.\d+s/.test(reloadedOutput), "persisted thinking duration missing");
 	assert(!reloadedOutput.includes("thought-line-12"), "persisted thinking content was not collapsed");
 	assertTextStartsAtColumnZero(reloadedRender, "Thought");
-	console.log("OK  thinking: static labels use full width, content stays hidden, history stays unchanged");
+	console.log("OK  thinking: visual-line tail, shared connector colors, Ctrl+O, summary/duration, history");
 }
+
 
 console.log("\nAll minimal-renderer checks passed.");

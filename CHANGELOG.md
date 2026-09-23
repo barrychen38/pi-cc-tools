@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Shared thinking state and theme across fresh extension module loads so `/reload` no longer disconnects live thinking events from the installed renderer, prematurely shows `Thought`, or loses previews and timing.
 - Added Pi 0.86 compatibility for wrapped thinking components so hidden thinking labels remain flush-left.
 - Preserved Pi's built-in tool metadata when applying compact renderers, including constrained sampling, argument preparation, execution mode, and prompt guidance.
 - Stored `write` / `edit` render metadata under JSON-compatible namespaced keys so summaries survive session serialization.
@@ -11,7 +12,7 @@
 
 ### Changed
 
-- Hidden thinking blocks now show static `Thinking…` / `Thought` labels without elapsed time; the original thinking content remains available through Pi's native click-to-expand interaction.
+- Thinking previews now wrap before taking the latest 3 visual lines, use tool-matching gray connectors, and retain a completed first-three-line preview with hidden-line count and duration. Native click and `Ctrl+O` expansion are supported; streaming flags pass through component wrappers.
 - Referenced `$skill` instructions now use Pi's transcript-aware structured system-prompt sections, preserving prompt-cache prefixes on Pi 0.86 while retaining a fallback for older Pi versions.
 - Development and lockfile verification now target Pi 0.86.0.
 - `Agent` / subagent output now keeps its native status background in transparent/outline modes while all other tool shells remain transparent.
